@@ -606,22 +606,50 @@ func (m model) helpView() string {
 
 func (m model) confirmView() string {
 	var b strings.Builder
+	sel := m.selectedBranches()
+
 	b.WriteString(headerStyle.Render("Confirm deletion"))
 	b.WriteString("\n\n")
 	flag := "-d (safe)"
 	if m.force {
 		flag = "-D (force)"
 	}
-	b.WriteString(fmt.Sprintf("Local delete mode: %s\n\n", flag))
-	for _, br := range m.selectedBranches() {
-		line := "  • " + br.name
+	remoteCount := 0
+	for _, br := range sel {
 		if br.deleteRemote && br.upstream != "" {
-			line += errStyle.Render(fmt.Sprintf("   + remote %s/%s", br.remoteName(), br.remoteBranch()))
+			remoteCount++
 		}
-		b.WriteString(line)
+	}
+	b.WriteString(fmt.Sprintf("Local delete mode: %s\n", flag))
+	b.WriteString(fmt.Sprintf("Deleting %d local branch(es), %d remote branch(es).\n\n", len(sel), remoteCount))
+
+	for _, br := range sel {
+		b.WriteString("  " + cursorStyle.Render("• "+br.name) + "\n")
+
+		date := br.committed.Format("2006-Jan-02")
+		if br.committedRel != "" {
+			date += " (" + br.committedRel + ")"
+		}
+		b.WriteString("      " + dimStyle.Render(fmt.Sprintf("%s  %s  %s", br.hash, date, truncate(br.subject, 50))) + "\n")
+
+		switch {
+		case br.gone:
+			b.WriteString("      " + goneStyle.Render("upstream gone: "+br.upstream) + "\n")
+		case br.upstream != "":
+			b.WriteString("      " + dimStyle.Render("upstream: "+br.upstream) + " " + m.trackStr(br) + "\n")
+		default:
+			b.WriteString("      " + dimStyle.Render("no upstream") + "\n")
+		}
+
+		if br.deleteRemote && br.upstream != "" {
+			b.WriteString("      " + errStyle.Render(fmt.Sprintf("+ delete remote %s/%s", br.remoteName(), br.remoteBranch())) + "\n")
+		}
+		if !m.force && br.ahead > 0 {
+			b.WriteString("      " + errStyle.Render(fmt.Sprintf("⚠ %d unmerged commit(s) — safe delete (-d) will fail; use force (f)", br.ahead)) + "\n")
+		}
 		b.WriteString("\n")
 	}
-	b.WriteString("\n")
+
 	b.WriteString(headerStyle.Render("Delete these branches? "))
 	b.WriteString(dimStyle.Render("(y = yes, n/esc = cancel)"))
 	b.WriteString("\n")
