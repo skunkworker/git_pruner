@@ -70,6 +70,7 @@ const (
 	stateList viewState = iota
 	stateConfirm
 	stateResult
+	stateHelp
 )
 
 type deleteResult struct {
@@ -108,6 +109,13 @@ var (
 	headerStyle  = lipgloss.NewStyle().Bold(true)
 	okStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
 	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+
+	nameStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("14")) // cyan
+	hashStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))  // yellow
+	subjectStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))  // light gray
+	aheadStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("10")) // green
+	behindStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))  // red
+	trackColStyle = lipgloss.NewStyle().Width(8)
 )
 
 // ---- git I/O ----
@@ -286,6 +294,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "q", "ctrl+c", "enter", "esc":
 				return m, tea.Quit
 			}
+		case stateHelp:
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			m.state = stateList
 		}
 	}
 	return m, nil
@@ -334,6 +347,8 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.sortBranches()
 	case "f":
 		m.force = !m.force
+	case "?":
+		m.state = stateHelp
 	case "d", "enter":
 		if len(m.selectedBranches()) > 0 {
 			m.state = stateConfirm
@@ -394,6 +409,8 @@ func (m model) View() string {
 		return m.confirmView()
 	case stateResult:
 		return m.resultView()
+	case stateHelp:
+		return m.helpView()
 	default:
 		return m.listView()
 	}
@@ -448,7 +465,7 @@ func (m model) listView() string {
 	}
 
 	b.WriteString("\n")
-	help := "↑/↓ move · space select · a/n all/none · r remote · s sort · o order · f force · d delete · q quit"
+	help := "↑/↓ move · space select · a/n all/none · r remote · s sort · o order · f force · d delete · ? help · q quit"
 	b.WriteString(dimStyle.Render(help))
 	if m.err != "" {
 		b.WriteString("\n")
@@ -462,19 +479,19 @@ func (m model) renderRow(i, nameW int) string {
 
 	cursor := "  "
 	if i == m.cursor {
-		cursor = "> "
+		cursor = cursorStyle.Render("> ")
 	}
 	sel := "[ ]"
 	if br.selected {
-		sel = "[x]"
+		sel = selStyle.Render("[x]")
 	}
 	rem := " "
 	if br.deleteRemote {
-		rem = "R"
+		rem = errStyle.Render("R")
 	}
 	cur := " "
 	if br.isCurrent {
-		cur = "*"
+		cur = currentStyle.Render("*")
 	}
 
 	name := br.name
@@ -483,24 +500,27 @@ func (m model) renderRow(i, nameW int) string {
 	}
 	name = fmt.Sprintf("%-*s", nameW, name)
 
+	var nameRendered string
+	switch {
+	case i == m.cursor:
+		nameRendered = cursorStyle.Render(name)
+	case br.isCurrent:
+		nameRendered = currentStyle.Render(name)
+	case br.selected:
+		nameRendered = selStyle.Render(name)
+	default:
+		nameRendered = nameStyle.Render(name)
+	}
+
 	track := m.trackStr(br)
+	abs := fmt.Sprintf("%-11s", br.committed.Format("2006-Jan-02"))
 	rel := fmt.Sprintf("%-13s", br.committedRel)
 	hash := fmt.Sprintf("%-8s", br.hash)
 
-	line := fmt.Sprintf("%s%s %s %s %s  %s %s %s %s",
-		cursor, sel, rem, cur, name, track,
-		dimStyle.Render(rel), dimStyle.Render(hash), truncate(br.subject, m.subjectWidth(nameW)))
-
-	switch {
-	case i == m.cursor:
-		return cursorStyle.Render(line)
-	case br.isCurrent:
-		return currentStyle.Render(line)
-	case br.selected:
-		return selStyle.Render(line)
-	default:
-		return line
-	}
+	return fmt.Sprintf("%s%s %s %s %s  %s %s %s %s %s",
+		cursor, sel, rem, cur, nameRendered, track,
+		dimStyle.Render(abs), dimStyle.Render(rel), hashStyle.Render(hash),
+		subjectStyle.Render(truncate(br.subject, m.subjectWidth(nameW))))
 }
 
 func (m model) trackStr(br branch) string {
@@ -508,23 +528,23 @@ func (m model) trackStr(br branch) string {
 		return goneStyle.Render(fmt.Sprintf("%-8s", "gone"))
 	}
 	if br.upstream == "" {
-		return fmt.Sprintf("%-8s", "-")
+		return trackColStyle.Render(dimStyle.Render("-"))
 	}
 	s := ""
 	if br.ahead > 0 {
-		s += "↑" + strconv.Itoa(br.ahead)
+		s += aheadStyle.Render("↑"+strconv.Itoa(br.ahead))
 	}
 	if br.behind > 0 {
-		s += "↓" + strconv.Itoa(br.behind)
+		s += behindStyle.Render("↓"+strconv.Itoa(br.behind))
 	}
 	if s == "" {
-		s = "="
+		s = currentStyle.Render("=")
 	}
-	return fmt.Sprintf("%-8s", s)
+	return trackColStyle.Render(s)
 }
 
 func (m model) subjectWidth(nameW int) int {
-	used := 2 + 3 + 1 + 1 + 1 + 1 + 1 + 1 + nameW + 2 + 8 + 1 + 13 + 1 + 8 + 1
+	used := 2 + 3 + 1 + 1 + 1 + 1 + 1 + 1 + nameW + 2 + 8 + 1 + 11 + 1 + 13 + 1 + 8 + 1
 	w := m.width - used
 	if w < 10 {
 		w = 10
@@ -540,6 +560,48 @@ func truncate(s string, w int) string {
 		return ""
 	}
 	return s[:w-1] + "…"
+}
+
+func (m model) helpView() string {
+	var b strings.Builder
+	b.WriteString(headerStyle.Render("git_pruner — help"))
+	b.WriteString("\n\n")
+
+	rows := [][2]string{
+		{"↑/↓, j/k", "move cursor"},
+		{"g/G, home/end", "jump to first/last"},
+		{"space", "select / deselect branch"},
+		{"a / n", "select all / none"},
+		{"r", "toggle delete of upstream remote branch"},
+		{"s", "cycle sort field (date, name, ahead/behind)"},
+		{"o", "toggle sort order (asc/desc)"},
+		{"f", "toggle force delete (-d / -D)"},
+		{"d, enter", "delete selected branches"},
+		{"?", "toggle this help screen"},
+		{"q, ctrl+c", "quit"},
+	}
+	for _, r := range rows {
+		b.WriteString("  " + cursorStyle.Render(fmt.Sprintf("%-14s", r[0])) + subjectStyle.Render(r[1]) + "\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(headerStyle.Render("Columns"))
+	b.WriteString("\n")
+	cols := [][2]string{
+		{"*", "current branch (cannot be deleted)"},
+		{"[x]", "selected for deletion"},
+		{"R", "its remote branch will also be deleted"},
+		{"↑/↓", "commits ahead of / behind upstream"},
+		{"gone", "upstream was configured but no longer exists"},
+	}
+	for _, c := range cols {
+		b.WriteString("  " + cursorStyle.Render(fmt.Sprintf("%-14s", c[0])) + subjectStyle.Render(c[1]) + "\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render("press any key to return"))
+	b.WriteString("\n")
+	return b.String()
 }
 
 func (m model) confirmView() string {
