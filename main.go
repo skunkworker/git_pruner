@@ -71,6 +71,7 @@ const (
 	stateConfirm
 	stateResult
 	stateHelp
+	stateDiff
 )
 
 type deleteResult struct {
@@ -90,12 +91,20 @@ type model struct {
 	field     sortField
 	ascending bool
 	force     bool
+	nameW     int // cached branch-name column width (see recomputeNameWidth)
 
 	state   viewState
 	results []deleteResult
 
+	diffBranch string   // branch whose diff is shown in stateDiff
+	diffBase   string   // base ref the diff was computed against
+	diffLines  []string // raw lines of the diff being viewed
+	diffTop    int      // scroll offset within diffLines
+
 	width, height int
 	err           string
+	status        string // transient info message (e.g. fetch results)
+	fetching      bool   // a background fetch --all --prune is in flight
 }
 
 // ---- styles ----
@@ -116,6 +125,10 @@ var (
 	aheadStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("10")) // green
 	behindStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))  // red
 	trackColStyle = lipgloss.NewStyle().Width(8)
+
+	addStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("10")) // green: additions
+	delStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))  // red: removals
+	hunkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("13")) // magenta: hunk headers
 )
 
 // ---- git I/O ----
@@ -181,6 +194,49 @@ func loadBranches() ([]branch, error) {
 	return branches, nil
 }
 
+// baseBranch returns a reference to diff a branch against: the repo's default
+// branch (origin/HEAD, else main, else master), excluding name itself.
+func baseBranch(name string) string {
+	if out, err := runGit("symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
+		if s := strings.TrimSpace(out); s != "" && s != name {
+			return s
+		}
+	}
+	for _, c := range []string{"main", "master"} {
+		if c == name {
+			continue
+		}
+		if _, err := runGit("rev-parse", "--verify", "--quiet", c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+// fetchDoneMsg reports completion of an async `git fetch --all --prune`.
+type fetchDoneMsg struct{ err error }
+
+// fetchPruneCmd fetches all remotes and prunes deleted remote-tracking refs so
+// that branches whose upstream is gone are detected. Run as a tea.Cmd to keep
+// the UI responsive while the (network-bound) fetch runs.
+func fetchPruneCmd() tea.Cmd {
+	return func() tea.Msg {
+		_, err := runGit("fetch", "--all", "--prune")
+		return fetchDoneMsg{err: err}
+	}
+}
+
+// loadDiff returns the patch introduced on name relative to its merge-base with
+// the repo's default branch — i.e. what the branch contains — and the base ref used.
+func loadDiff(name string) (diff, base string, err error) {
+	base = baseBranch(name)
+	if base == "" {
+		base = "HEAD"
+	}
+	diff, err = runGit("diff", base+"..."+name)
+	return diff, base, err
+}
+
 // ---- model ----
 
 func initialModel() (model, error) {
@@ -192,6 +248,7 @@ func initialModel() (model, error) {
 		return model{}, err
 	}
 	m := model{branches: branches, field: sortDate, ascending: false, height: 24, width: 100}
+	m.recomputeNameWidth()
 	m.sortBranches()
 	return m, nil
 }
@@ -283,12 +340,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.adjustScroll()
 		return m, nil
+	case fetchDoneMsg:
+		m.fetching = false
+		if msg.err != nil {
+			m.err = msg.err.Error()
+			m.status = ""
+			return m, nil
+		}
+		if branches, err := loadBranches(); err == nil {
+			m.branches = branches
+			m.recomputeNameWidth()
+			m.clampCursor()
+			m.sortBranches()
+		}
+		gone := 0
+		for i := range m.branches {
+			if m.branches[i].gone && !m.branches[i].isCurrent {
+				m.branches[i].selected = true
+				gone++
+			}
+		}
+		m.err = ""
+		if gone > 0 {
+			m.status = fmt.Sprintf("fetched & pruned — %d gone branch(es) selected; press d to prune", gone)
+		} else {
+			m.status = "fetched & pruned — no gone branches"
+		}
+		return m, nil
 	case tea.KeyMsg:
 		switch m.state {
 		case stateList:
 			return m.updateList(msg)
 		case stateConfirm:
 			return m.updateConfirm(msg)
+		case stateDiff:
+			return m.updateDiff(msg)
 		case stateResult:
 			switch msg.String() {
 			case "q", "ctrl+c", "enter", "esc":
@@ -347,6 +433,31 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.sortBranches()
 	case "f":
 		m.force = !m.force
+	case "p":
+		if !m.fetching {
+			m.fetching = true
+			m.err = ""
+			m.status = "fetching --all --prune…"
+			return m, fetchPruneCmd()
+		}
+	case "v":
+		if b := m.cur(); b != nil {
+			diff, base, err := loadDiff(b.name)
+			if err != nil {
+				m.err = err.Error()
+				break
+			}
+			m.err = ""
+			m.diffBranch = b.name
+			m.diffBase = base
+			if strings.TrimSpace(diff) == "" {
+				m.diffLines = nil
+			} else {
+				m.diffLines = strings.Split(strings.TrimRight(diff, "\n"), "\n")
+			}
+			m.diffTop = 0
+			m.state = stateDiff
+		}
 	case "?":
 		m.state = stateHelp
 	case "d", "enter":
@@ -370,12 +481,52 @@ func (m model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *model) clampDiff() {
+	max := len(m.diffLines) - m.visibleRows()
+	if max < 0 {
+		max = 0
+	}
+	if m.diffTop > max {
+		m.diffTop = max
+	}
+	if m.diffTop < 0 {
+		m.diffTop = 0
+	}
+}
+
+func (m model) updateDiff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "esc", "v":
+		m.state = stateList
+	case "ctrl+c":
+		return m, tea.Quit
+	case "up", "k":
+		m.diffTop--
+		m.clampDiff()
+	case "down", "j":
+		m.diffTop++
+		m.clampDiff()
+	case "ctrl+u", "pgup":
+		m.diffTop -= m.visibleRows() / 2
+		m.clampDiff()
+	case "ctrl+d", "pgdown", " ":
+		m.diffTop += m.visibleRows() / 2
+		m.clampDiff()
+	case "g", "home":
+		m.diffTop = 0
+	case "G", "end":
+		m.diffTop = len(m.diffLines)
+		m.clampDiff()
+	}
+	return m, nil
+}
+
 func (m *model) performDeletions() {
 	m.results = nil
 	for _, b := range m.selectedBranches() {
 		res := deleteResult{name: b.name}
 		flag := "-d"
-		if m.force {
+		if m.force || b.gone {
 			flag = "-D"
 		}
 		if _, err := runGit("branch", flag, b.name); err != nil {
@@ -397,6 +548,7 @@ func (m *model) performDeletions() {
 		m.branches = branches
 		m.cursor = 0
 		m.top = 0
+		m.recomputeNameWidth()
 		m.sortBranches()
 	}
 }
@@ -411,12 +563,68 @@ func (m model) View() string {
 		return m.resultView()
 	case stateHelp:
 		return m.helpView()
+	case stateDiff:
+		return m.diffView()
 	default:
 		return m.listView()
 	}
 }
 
-func (m model) nameWidth() int {
+func colorizeDiffLine(line string) string {
+	switch {
+	case strings.HasPrefix(line, "+++"), strings.HasPrefix(line, "---"):
+		return headerStyle.Render(line)
+	case strings.HasPrefix(line, "diff "), strings.HasPrefix(line, "index "),
+		strings.HasPrefix(line, "new file"), strings.HasPrefix(line, "deleted file"),
+		strings.HasPrefix(line, "rename "), strings.HasPrefix(line, "similarity "):
+		return dimStyle.Render(line)
+	case strings.HasPrefix(line, "@@"):
+		return hunkStyle.Render(line)
+	case strings.HasPrefix(line, "+"):
+		return addStyle.Render(line)
+	case strings.HasPrefix(line, "-"):
+		return delStyle.Render(line)
+	default:
+		return line
+	}
+}
+
+func (m model) diffView() string {
+	var b strings.Builder
+
+	base := m.diffBase
+	b.WriteString(headerStyle.Render(fmt.Sprintf("diff — %s (vs %s)", m.diffBranch, base)))
+	b.WriteString("\n\n")
+
+	if len(m.diffLines) == 0 {
+		b.WriteString(dimStyle.Render("no changes — branch matches " + base))
+		b.WriteString("\n\n")
+		b.WriteString(dimStyle.Render("q/esc back · v back"))
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	vis := m.visibleRows()
+	end := m.diffTop + vis
+	if end > len(m.diffLines) {
+		end = len(m.diffLines)
+	}
+	for i := m.diffTop; i < end; i++ {
+		b.WriteString(colorizeDiffLine(truncate(m.diffLines[i], m.width)))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	pos := fmt.Sprintf("[%d-%d / %d]", m.diffTop+1, end, len(m.diffLines))
+	help := "↑/↓ scroll · space/ctrl+d page · g/G top/bottom · q/esc/v back"
+	b.WriteString(dimStyle.Render(pos + "  " + help))
+	b.WriteString("\n")
+	return b.String()
+}
+
+// recomputeNameWidth caches the branch-name column width; call whenever the
+// branch list changes (it depends only on the set of names, not render state).
+func (m *model) recomputeNameWidth() {
 	w := 0
 	for _, br := range m.branches {
 		if len(br.name) > w {
@@ -429,7 +637,7 @@ func (m model) nameWidth() int {
 	if w < 6 {
 		w = 6
 	}
-	return w
+	m.nameW = w
 }
 
 func (m model) listView() string {
@@ -453,7 +661,7 @@ func (m model) listView() string {
 		b.WriteString("\n")
 	}
 
-	nameW := m.nameWidth()
+	nameW := m.nameW
 	vis := m.visibleRows()
 	end := m.top + vis
 	if end > len(m.branches) {
@@ -465,8 +673,12 @@ func (m model) listView() string {
 	}
 
 	b.WriteString("\n")
-	help := "↑/↓ move · space select · a/n all/none · r remote · s sort · o order · f force · d delete · ? help · q quit"
+	help := "↑/↓ move · space select · a/n all/none · r remote · v view · p prune · s sort · o order · f force · d delete · ? help · q quit"
 	b.WriteString(dimStyle.Render(help))
+	if m.status != "" {
+		b.WriteString("\n")
+		b.WriteString(okStyle.Render(m.status))
+	}
 	if m.err != "" {
 		b.WriteString("\n")
 		b.WriteString(errStyle.Render(m.err))
@@ -573,6 +785,8 @@ func (m model) helpView() string {
 		{"space", "select / deselect branch"},
 		{"a / n", "select all / none"},
 		{"r", "toggle delete of upstream remote branch"},
+		{"v", "view branch diff (green add / red remove)"},
+		{"p", "fetch --all --prune & select gone branches"},
 		{"s", "cycle sort field (date, name, ahead/behind)"},
 		{"o", "toggle sort order (asc/desc)"},
 		{"f", "toggle force delete (-d / -D)"},
@@ -634,7 +848,7 @@ func (m model) confirmView() string {
 
 		switch {
 		case br.gone:
-			b.WriteString("      " + goneStyle.Render("upstream gone: "+br.upstream) + "\n")
+			b.WriteString("      " + goneStyle.Render("upstream gone: "+br.upstream+" — will prune with -D (force)") + "\n")
 		case br.upstream != "":
 			b.WriteString("      " + dimStyle.Render("upstream: "+br.upstream) + " " + m.trackStr(br) + "\n")
 		default:
@@ -644,7 +858,7 @@ func (m model) confirmView() string {
 		if br.deleteRemote && br.upstream != "" {
 			b.WriteString("      " + errStyle.Render(fmt.Sprintf("+ delete remote %s/%s", br.remoteName(), br.remoteBranch())) + "\n")
 		}
-		if !m.force && br.ahead > 0 {
+		if !m.force && !br.gone && br.ahead > 0 {
 			b.WriteString("      " + errStyle.Render(fmt.Sprintf("⚠ %d unmerged commit(s) — safe delete (-d) will fail; use force (f)", br.ahead)) + "\n")
 		}
 		b.WriteString("\n")

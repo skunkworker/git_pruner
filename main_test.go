@@ -105,6 +105,59 @@ func TestLoadAndSort(t *testing.T) {
 	}
 }
 
+func TestLoadDiff(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	// feature/unmerged adds file "b" relative to main.
+	diff, _, err := loadDiff("feature/unmerged")
+	if err != nil {
+		t.Fatalf("loadDiff: %v", err)
+	}
+	if !strings.Contains(diff, "+++ b/b") || !strings.Contains(diff, "+b") {
+		t.Fatalf("diff should show added file b:\n%s", diff)
+	}
+
+	// main vs the default base should be empty.
+	if d, _, err := loadDiff("main"); err != nil || strings.TrimSpace(d) != "" {
+		t.Fatalf("main diff should be empty, err=%v out=%q", err, d)
+	}
+}
+
+func TestPruneGoneBranch(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	// Delete the remote branch, then prune so the local tracking ref goes "gone".
+	git(t, repo, "push", "-q", "origin", "--delete", "feature/tracked")
+	git(t, repo, "fetch", "-q", "--all", "--prune")
+
+	branches, err := loadBranches()
+	if err != nil {
+		t.Fatalf("loadBranches: %v", err)
+	}
+	tb := find(branches, "feature/tracked")
+	if tb == nil || !tb.gone {
+		t.Fatalf("feature/tracked should be gone after remote delete + prune: %+v", tb)
+	}
+
+	// A gone branch must prune even in safe mode (-d would refuse it).
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	find(m.branches, "feature/tracked").selected = true
+	m.force = false
+	m.performDeletions()
+
+	if len(m.results) != 1 || !m.results[0].localOK {
+		t.Fatalf("gone branch should force-delete: %+v", m.results)
+	}
+	if find(m.branches, "feature/tracked") != nil {
+		t.Fatal("feature/tracked should be gone after prune")
+	}
+}
+
 func TestRemoteHelpers(t *testing.T) {
 	b := branch{name: "feature/tracked", upstream: "origin/feature/tracked"}
 	if b.remoteName() != "origin" {
