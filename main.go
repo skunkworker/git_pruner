@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,21 +26,22 @@ type branch struct {
 	ahead        int
 	behind       int
 	gone         bool // upstream was configured but no longer exists
+	remoteMerged bool // upstream is merged into the remote default branch (safe to delete)
 	isCurrent    bool
 	selected     bool
 	deleteRemote bool
 }
 
 func (b branch) remoteName() string {
-	if i := strings.IndexByte(b.upstream, '/'); i >= 0 {
-		return b.upstream[:i]
+	if name, _, ok := strings.Cut(b.upstream, "/"); ok {
+		return name
 	}
 	return "origin"
 }
 
 func (b branch) remoteBranch() string {
-	if i := strings.IndexByte(b.upstream, '/'); i >= 0 {
-		return b.upstream[i+1:]
+	if _, name, ok := strings.Cut(b.upstream, "/"); ok {
+		return name
 	}
 	return b.name
 }
@@ -50,6 +52,7 @@ const (
 	sortDate sortField = iota
 	sortName
 	sortAheadBehind
+	sortFieldCount // number of sort fields; keep last
 )
 
 func (s sortField) String() string {
@@ -69,6 +72,8 @@ type viewState int
 const (
 	stateList viewState = iota
 	stateConfirm
+	stateForcePrompt
+	stateDeleting
 	stateResult
 	stateHelp
 	stateDiff
@@ -76,8 +81,11 @@ const (
 
 type deleteResult struct {
 	name        string
+	ahead       int  // commits the branch was ahead of upstream (for the force prompt)
+	done        bool // the async deletion for this branch has completed
 	localOK     bool
 	localErr    string
+	forceable   bool // a safe (-d) delete failed and could be retried with -D
 	remoteTried bool
 	remoteOK    bool
 	remoteErr   string
@@ -95,6 +103,10 @@ type model struct {
 
 	state   viewState
 	results []deleteResult
+
+	remoteDefault string // resolved remote default branch, e.g. "origin/main"
+
+	spinnerFrame int // animation frame for the deleting spinner (deletion counts derive from results)
 
 	diffBranch string   // branch whose diff is shown in stateDiff
 	diffBase   string   // base ref the diff was computed against
@@ -124,7 +136,7 @@ var (
 	subjectStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))  // light gray
 	aheadStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("10")) // green
 	behindStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))  // red
-	trackColStyle = lipgloss.NewStyle().Width(8)
+	trackColStyle = lipgloss.NewStyle().Width(10)                        // ahead/behind + optional merged ✓
 
 	addStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("10")) // green: additions
 	delStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))  // red: removals
@@ -213,6 +225,43 @@ func baseBranch(name string) string {
 	return ""
 }
 
+// remoteDefault resolves the remote's default branch as a remote-tracking ref
+// (e.g. "origin/main"): origin/HEAD if set, else origin/main, else origin/master.
+// Returns "" when none can be determined.
+func remoteDefault() string {
+	if out, err := runGit("symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
+		if s := strings.TrimSpace(out); s != "" {
+			return s
+		}
+	}
+	for _, c := range []string{"origin/main", "origin/master"} {
+		if _, err := runGit("rev-parse", "--verify", "--quiet", "refs/remotes/"+c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+// remoteMergedSet returns the set of remote-tracking branches (short names, e.g.
+// "origin/feature") whose tip is merged into def. Operates on local
+// remote-tracking refs, so it needs no network — it reflects the last fetch.
+func remoteMergedSet(def string) map[string]bool {
+	set := map[string]bool{}
+	if def == "" {
+		return set
+	}
+	out, err := runGit("branch", "-r", "--merged", def, "--format=%(refname:short)")
+	if err != nil {
+		return set
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if s := strings.TrimSpace(line); s != "" {
+			set[s] = true
+		}
+	}
+	return set
+}
+
 // fetchDoneMsg reports completion of an async `git fetch --all --prune`.
 type fetchDoneMsg struct{ err error }
 
@@ -224,6 +273,34 @@ func fetchPruneCmd() tea.Cmd {
 		_, err := runGit("fetch", "--all", "--prune")
 		return fetchDoneMsg{err: err}
 	}
+}
+
+// branchDeletedMsg reports the outcome of one branch's async deletion; idx is
+// its position in m.results.
+type branchDeletedMsg struct {
+	idx int
+	res deleteResult
+}
+
+// spinnerTickMsg advances the deleting-view spinner animation.
+type spinnerTickMsg struct{}
+
+// spinnerFrames are the braille frames cycled while deletions are in flight.
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// deleteBranchCmd wraps the deleteBranch worker as a tea.Cmd so deletions run off
+// the update loop. It captures only a branch value (never the model), so each runs
+// independently and concurrently under tea.Batch.
+func deleteBranchCmd(idx int, b branch, flag string, wantRemote bool) tea.Cmd {
+	return func() tea.Msg {
+		res := deleteBranch(b.name, flag, wantRemote, b.remoteName(), b.remoteBranch(), b.ahead)
+		return branchDeletedMsg{idx: idx, res: res}
+	}
+}
+
+// spinnerTickCmd schedules the next spinner frame.
+func spinnerTickCmd() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return spinnerTickMsg{} })
 }
 
 // loadDiff returns the patch introduced on name relative to its merge-base with
@@ -249,6 +326,7 @@ func initialModel() (model, error) {
 	}
 	m := model{branches: branches, field: sortDate, ascending: false, height: 24, width: 100}
 	m.recomputeNameWidth()
+	m.refreshMergeInfo()
 	m.sortBranches()
 	return m, nil
 }
@@ -285,21 +363,12 @@ func (m *model) sortBranches() {
 }
 
 func (m *model) clampCursor() {
-	if m.cursor >= len(m.branches) {
-		m.cursor = len(m.branches) - 1
-	}
-	if m.cursor < 0 {
-		m.cursor = 0
-	}
+	m.cursor = max(0, min(m.cursor, len(m.branches)-1))
 	m.adjustScroll()
 }
 
 func (m *model) visibleRows() int {
-	r := m.height - 5 // header (2) + footer (3)
-	if r < 1 {
-		r = 1
-	}
-	return r
+	return max(1, m.height-5) // minus header (2) + footer (3)
 }
 
 func (m *model) adjustScroll() {
@@ -310,9 +379,7 @@ func (m *model) adjustScroll() {
 	if m.cursor >= m.top+vis {
 		m.top = m.cursor - vis + 1
 	}
-	if m.top < 0 {
-		m.top = 0
-	}
+	m.top = max(0, m.top)
 }
 
 func (m *model) cur() *branch {
@@ -348,10 +415,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if branches, err := loadBranches(); err == nil {
-			m.branches = branches
-			m.recomputeNameWidth()
-			m.clampCursor()
-			m.sortBranches()
+			m.applyBranches(branches) // preserves the cursor by name (fetch is non-destructive)
 		}
 		gone := 0
 		for i := range m.branches {
@@ -367,14 +431,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "fetched & pruned — no gone branches"
 		}
 		return m, nil
+	case branchDeletedMsg:
+		if msg.idx >= 0 && msg.idx < len(m.results) {
+			m.results[msg.idx] = msg.res
+		}
+		if m.deletesDone() >= len(m.results) {
+			m.reloadBranches()
+			if len(m.forceableFailures()) > 0 {
+				m.state = stateForcePrompt
+			} else {
+				m.state = stateResult
+			}
+		}
+		return m, nil
+	case spinnerTickMsg:
+		if m.state == stateDeleting {
+			m.spinnerFrame++
+			return m, spinnerTickCmd()
+		}
+		return m, nil
 	case tea.KeyMsg:
 		switch m.state {
 		case stateList:
 			return m.updateList(msg)
 		case stateConfirm:
 			return m.updateConfirm(msg)
+		case stateForcePrompt:
+			return m.updateForcePrompt(msg)
 		case stateDiff:
 			return m.updateDiff(msg)
+		case stateDeleting:
+			// Deletions are in flight; ignore input except an abort.
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
 		case stateResult:
 			switch msg.String() {
 			case "q", "ctrl+c", "enter", "esc":
@@ -426,7 +516,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.branches[i].deleteRemote = false
 		}
 	case "s":
-		m.field = (m.field + 1) % 3
+		m.field = (m.field + 1) % sortFieldCount
 		m.sortBranches()
 	case "o":
 		m.ascending = !m.ascending
@@ -471,8 +561,13 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y", "Y":
-		m.performDeletions()
-		m.state = stateResult
+		// Local only: never delete remotes on the same key that deletes locals.
+		return m, m.startDeletions(false)
+	case "R":
+		// Local + remote — only meaningful when at least one remote is armed.
+		if m.armedRemoteCount() > 0 {
+			return m, m.startDeletions(true)
+		}
 	case "n", "N", "esc", "q":
 		m.state = stateList
 	case "ctrl+c":
@@ -481,17 +576,79 @@ func (m model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// countArmedRemotes counts branches whose remote deletion is armed.
+func countArmedRemotes(branches []branch) int {
+	n := 0
+	for _, b := range branches {
+		if b.deleteRemote && b.upstream != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// armedRemoteCount counts selected branches whose remote deletion is armed.
+func (m model) armedRemoteCount() int {
+	return countArmedRemotes(m.selectedBranches())
+}
+
+// startDeletions kicks off the asynchronous deletion of the selected branches,
+// pre-seeding results, entering stateDeleting, and returning a batch of one cmd
+// per branch (which run concurrently) plus the spinner tick. Remote branches are
+// pushed --delete only when includeRemote is set (see updateConfirm).
+func (m *model) startDeletions(includeRemote bool) tea.Cmd {
+	sel := m.selectedBranches()
+	m.results = make([]deleteResult, len(sel))
+	m.spinnerFrame = 0
+	m.state = stateDeleting
+
+	cmds := []tea.Cmd{spinnerTickCmd()}
+	for i, b := range sel {
+		m.results[i] = deleteResult{name: b.name, ahead: b.ahead}
+		wantRemote := includeRemote && b.deleteRemote && b.upstream != ""
+		cmds = append(cmds, deleteBranchCmd(i, b, b.deleteFlag(m.force), wantRemote))
+	}
+	return tea.Batch(cmds...)
+}
+
+// deletesDone counts how many of the current run's deletions have completed.
+func (m model) deletesDone() int {
+	n := 0
+	for _, r := range m.results {
+		if r.done {
+			n++
+		}
+	}
+	return n
+}
+
+// forceableFailures returns the results whose safe (-d) local delete was
+// refused — the ones a force (-D) delete could clear.
+func (m model) forceableFailures() []deleteResult {
+	var out []deleteResult
+	for _, r := range m.results {
+		if !r.localOK && r.forceable {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (m model) updateForcePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		m.forceDeleteUnmerged()
+		m.state = stateResult
+	case "n", "N", "esc", "q", "enter":
+		m.state = stateResult
+	case "ctrl+c":
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
 func (m *model) clampDiff() {
-	max := len(m.diffLines) - m.visibleRows()
-	if max < 0 {
-		max = 0
-	}
-	if m.diffTop > max {
-		m.diffTop = max
-	}
-	if m.diffTop < 0 {
-		m.diffTop = 0
-	}
+	m.diffTop = max(0, min(m.diffTop, len(m.diffLines)-m.visibleRows()))
 }
 
 func (m model) updateDiff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -521,36 +678,98 @@ func (m model) updateDiff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// deleteFlag returns the git branch delete flag for b under the given force mode:
+// -D for forced or gone branches (which -d refuses), -d otherwise.
+func (b branch) deleteFlag(force bool) string {
+	if force || b.gone {
+		return "-D"
+	}
+	return "-d"
+}
+
+// deleteBranch runs one branch's local delete and, when wantRemote is set, its
+// remote-branch push --delete. It is the single worker shared by the synchronous
+// performDeletions path and the asynchronous deleteBranchCmd path.
+func deleteBranch(name, flag string, wantRemote bool, remoteName, remoteBranch string, ahead int) deleteResult {
+	res := deleteResult{name: name, ahead: ahead, done: true}
+	if _, err := runGit("branch", flag, name); err != nil {
+		res.localErr = err.Error()
+		res.forceable = flag == "-d" // a refused safe delete can be retried with -D
+	} else {
+		res.localOK = true
+	}
+	if wantRemote {
+		res.remoteTried = true
+		if _, err := runGit("push", remoteName, "--delete", remoteBranch); err != nil {
+			res.remoteErr = err.Error()
+		} else {
+			res.remoteOK = true
+		}
+	}
+	return res
+}
+
+// performDeletions deletes the selected branches synchronously. The interactive
+// UI uses the async startDeletions path instead; this remains for tests and as
+// the straightforward equivalent.
 func (m *model) performDeletions() {
 	m.results = nil
 	for _, b := range m.selectedBranches() {
-		res := deleteResult{name: b.name}
-		flag := "-d"
-		if m.force || b.gone {
-			flag = "-D"
-		}
-		if _, err := runGit("branch", flag, b.name); err != nil {
-			res.localErr = err.Error()
-		} else {
-			res.localOK = true
-		}
-		if b.deleteRemote && b.upstream != "" {
-			res.remoteTried = true
-			if _, err := runGit("push", b.remoteName(), "--delete", b.remoteBranch()); err != nil {
-				res.remoteErr = err.Error()
-			} else {
-				res.remoteOK = true
-			}
-		}
+		wantRemote := b.deleteRemote && b.upstream != ""
+		res := deleteBranch(b.name, b.deleteFlag(m.force), wantRemote, b.remoteName(), b.remoteBranch(), b.ahead)
 		m.results = append(m.results, res)
 	}
+	m.reloadBranches()
+}
+
+// applyBranches installs a freshly-loaded branch set and recomputes everything
+// derived from it (name-width, merge info, sort order). Callers set their own
+// cursor policy around it. This is the single refresh core shared by
+// reloadBranches and the fetch handler.
+func (m *model) applyBranches(branches []branch) {
+	m.branches = branches
+	m.recomputeNameWidth()
+	m.refreshMergeInfo()
+	m.sortBranches()
+}
+
+// reloadBranches refreshes the branch list from git and resets the view to the
+// top — appropriate after a mutation that may have removed the cursor's branch.
+func (m *model) reloadBranches() {
 	if branches, err := loadBranches(); err == nil {
-		m.branches = branches
 		m.cursor = 0
 		m.top = 0
-		m.recomputeNameWidth()
-		m.sortBranches()
+		m.applyBranches(branches)
 	}
+}
+
+// refreshMergeInfo caches the remote default branch and marks each branch whose
+// upstream is merged into it. Call after every branch (re)load.
+func (m *model) refreshMergeInfo() {
+	m.remoteDefault = remoteDefault()
+	merged := remoteMergedSet(m.remoteDefault)
+	for i := range m.branches {
+		m.branches[i].remoteMerged = m.branches[i].upstream != "" && merged[m.branches[i].upstream]
+	}
+}
+
+// forceDeleteUnmerged re-runs the deletions that a safe (-d) delete refused,
+// this time with -D. It updates the matching result in place so the results
+// screen reflects the retry outcome.
+func (m *model) forceDeleteUnmerged() {
+	for i := range m.results {
+		r := &m.results[i]
+		if r.localOK || !r.forceable {
+			continue
+		}
+		if _, err := runGit("branch", "-D", r.name); err != nil {
+			r.localErr = err.Error()
+		} else {
+			r.localOK = true
+			r.localErr = ""
+		}
+	}
+	m.reloadBranches()
 }
 
 // ---- views ----
@@ -559,6 +778,10 @@ func (m model) View() string {
 	switch m.state {
 	case stateConfirm:
 		return m.confirmView()
+	case stateForcePrompt:
+		return m.forcePromptView()
+	case stateDeleting:
+		return m.deletingView()
 	case stateResult:
 		return m.resultView()
 	case stateHelp:
@@ -605,10 +828,7 @@ func (m model) diffView() string {
 	}
 
 	vis := m.visibleRows()
-	end := m.diffTop + vis
-	if end > len(m.diffLines) {
-		end = len(m.diffLines)
-	}
+	end := min(m.diffTop+vis, len(m.diffLines))
 	for i := m.diffTop; i < end; i++ {
 		b.WriteString(colorizeDiffLine(truncate(m.diffLines[i], m.width)))
 		b.WriteString("\n")
@@ -627,17 +847,9 @@ func (m model) diffView() string {
 func (m *model) recomputeNameWidth() {
 	w := 0
 	for _, br := range m.branches {
-		if len(br.name) > w {
-			w = len(br.name)
-		}
+		w = max(w, len(br.name))
 	}
-	if w > 40 {
-		w = 40
-	}
-	if w < 6 {
-		w = 6
-	}
-	m.nameW = w
+	m.nameW = min(40, max(6, w))
 }
 
 func (m model) listView() string {
@@ -663,10 +875,7 @@ func (m model) listView() string {
 
 	nameW := m.nameW
 	vis := m.visibleRows()
-	end := m.top + vis
-	if end > len(m.branches) {
-		end = len(m.branches)
-	}
+	end := min(m.top+vis, len(m.branches))
 	for i := m.top; i < end; i++ {
 		b.WriteString(m.renderRow(i, nameW))
 		b.WriteString("\n")
@@ -706,11 +915,7 @@ func (m model) renderRow(i, nameW int) string {
 		cur = currentStyle.Render("*")
 	}
 
-	name := br.name
-	if len(name) > nameW {
-		name = name[:nameW-1] + "…"
-	}
-	name = fmt.Sprintf("%-*s", nameW, name)
+	name := fmt.Sprintf("%-*s", nameW, truncate(br.name, nameW))
 
 	var nameRendered string
 	switch {
@@ -744,24 +949,26 @@ func (m model) trackStr(br branch) string {
 	}
 	s := ""
 	if br.ahead > 0 {
-		s += aheadStyle.Render("↑"+strconv.Itoa(br.ahead))
+		s += aheadStyle.Render("↑" + strconv.Itoa(br.ahead))
 	}
 	if br.behind > 0 {
-		s += behindStyle.Render("↓"+strconv.Itoa(br.behind))
+		s += behindStyle.Render("↓" + strconv.Itoa(br.behind))
 	}
 	if s == "" {
 		s = currentStyle.Render("=")
+	}
+	if br.remoteMerged { // upstream is merged into the remote default — safe to delete
+		s += okStyle.Render(" ✓")
 	}
 	return trackColStyle.Render(s)
 }
 
 func (m model) subjectWidth(nameW int) int {
-	used := 2 + 3 + 1 + 1 + 1 + 1 + 1 + 1 + nameW + 2 + 8 + 1 + 11 + 1 + 13 + 1 + 8 + 1
-	w := m.width - used
-	if w < 10 {
-		w = 10
-	}
-	return w
+	// Sum of every fixed column width and separator in renderRow's format,
+	// plus nameW; keep in sync with that format string. The 10 is the track
+	// column (trackColStyle width); the trailing 8 is the hash column.
+	used := 2 + 3 + 1 + 1 + 1 + 1 + 1 + 1 + nameW + 2 + 10 + 1 + 11 + 1 + 13 + 1 + 8 + 1
+	return max(10, m.width-used)
 }
 
 func truncate(s string, w int) string {
@@ -779,7 +986,13 @@ func (m model) helpView() string {
 	b.WriteString(headerStyle.Render("git_pruner — help"))
 	b.WriteString("\n\n")
 
-	rows := [][2]string{
+	writeRows := func(pairs [][2]string) {
+		for _, p := range pairs {
+			b.WriteString("  " + cursorStyle.Render(fmt.Sprintf("%-14s", p[0])) + subjectStyle.Render(p[1]) + "\n")
+		}
+	}
+
+	writeRows([][2]string{
 		{"↑/↓, j/k", "move cursor"},
 		{"g/G, home/end", "jump to first/last"},
 		{"space", "select / deselect branch"},
@@ -790,27 +1003,24 @@ func (m model) helpView() string {
 		{"s", "cycle sort field (date, name, ahead/behind)"},
 		{"o", "toggle sort order (asc/desc)"},
 		{"f", "toggle force delete (-d / -D)"},
-		{"d, enter", "delete selected branches"},
+		{"d, enter", "delete selected branches (local)"},
+		{"", "on confirm: y = local only · R = local + remote"},
+		{"", "(unmerged -d failures prompt to retry with -D)"},
 		{"?", "toggle this help screen"},
 		{"q, ctrl+c", "quit"},
-	}
-	for _, r := range rows {
-		b.WriteString("  " + cursorStyle.Render(fmt.Sprintf("%-14s", r[0])) + subjectStyle.Render(r[1]) + "\n")
-	}
+	})
 
 	b.WriteString("\n")
 	b.WriteString(headerStyle.Render("Columns"))
 	b.WriteString("\n")
-	cols := [][2]string{
+	writeRows([][2]string{
 		{"*", "current branch (cannot be deleted)"},
 		{"[x]", "selected for deletion"},
 		{"R", "its remote branch will also be deleted"},
 		{"↑/↓", "commits ahead of / behind upstream"},
+		{"✓", "upstream merged into remote default (safe)"},
 		{"gone", "upstream was configured but no longer exists"},
-	}
-	for _, c := range cols {
-		b.WriteString("  " + cursorStyle.Render(fmt.Sprintf("%-14s", c[0])) + subjectStyle.Render(c[1]) + "\n")
-	}
+	})
 
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("press any key to return"))
@@ -828,12 +1038,7 @@ func (m model) confirmView() string {
 	if m.force {
 		flag = "-D (force)"
 	}
-	remoteCount := 0
-	for _, br := range sel {
-		if br.deleteRemote && br.upstream != "" {
-			remoteCount++
-		}
-	}
+	remoteCount := countArmedRemotes(sel)
 	b.WriteString(fmt.Sprintf("Local delete mode: %s\n", flag))
 	b.WriteString(fmt.Sprintf("Deleting %d local branch(es), %d remote branch(es).\n\n", len(sel), remoteCount))
 
@@ -855,6 +1060,14 @@ func (m model) confirmView() string {
 			b.WriteString("      " + dimStyle.Render("no upstream") + "\n")
 		}
 
+		if br.upstream != "" && m.remoteDefault != "" {
+			if br.remoteMerged {
+				b.WriteString("      " + okStyle.Render("✓ merged into "+m.remoteDefault) + "\n")
+			} else {
+				b.WriteString("      " + goneStyle.Render("⚠ not merged into "+m.remoteDefault) + "\n")
+			}
+		}
+
 		if br.deleteRemote && br.upstream != "" {
 			b.WriteString("      " + errStyle.Render(fmt.Sprintf("+ delete remote %s/%s", br.remoteName(), br.remoteBranch())) + "\n")
 		}
@@ -865,7 +1078,71 @@ func (m model) confirmView() string {
 	}
 
 	b.WriteString(headerStyle.Render("Delete these branches? "))
-	b.WriteString(dimStyle.Render("(y = yes, n/esc = cancel)"))
+	if remoteCount > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("(y = local only · R = local + remote (%d) · n/esc = cancel)", remoteCount)))
+	} else {
+		b.WriteString(dimStyle.Render("(y = yes · n/esc = cancel)"))
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+func (m model) forcePromptView() string {
+	var b strings.Builder
+	failures := m.forceableFailures()
+
+	b.WriteString(headerStyle.Render("Force delete unmerged branches?"))
+	b.WriteString("\n\n")
+	b.WriteString(fmt.Sprintf("%d branch(es) were refused by safe delete (-d) because they are not\n", len(failures)))
+	b.WriteString("fully merged. Force deleting (-D) will ")
+	b.WriteString(errStyle.Render("permanently discard their unmerged commits"))
+	b.WriteString(".\n\n")
+
+	for _, r := range failures {
+		b.WriteString("  " + cursorStyle.Render("• "+r.name) + "\n")
+		if r.ahead > 0 {
+			b.WriteString("      " + errStyle.Render(fmt.Sprintf("⚠ %d unmerged commit(s) will be lost", r.ahead)) + "\n")
+		}
+	}
+
+	b.WriteString("\n")
+	b.WriteString(headerStyle.Render("Force delete (-D) these branches? "))
+	b.WriteString(dimStyle.Render("(y = yes, discard · n/esc = keep them)"))
+	b.WriteString("\n")
+	return b.String()
+}
+
+// writeResultLines renders one completed deletion result (local, then remote if
+// tried) into b. Shared by the results screen and the live deleting screen.
+func writeResultLines(b *strings.Builder, r deleteResult) {
+	if r.localOK {
+		b.WriteString(okStyle.Render("  ✓ ") + "deleted local " + r.name + "\n")
+	} else {
+		b.WriteString(errStyle.Render("  ✗ ") + "local " + r.name + ": " + r.localErr + "\n")
+	}
+	if r.remoteTried {
+		if r.remoteOK {
+			b.WriteString(okStyle.Render("  ✓ ") + "deleted remote " + r.name + "\n")
+		} else {
+			b.WriteString(errStyle.Render("  ✗ ") + "remote " + r.name + ": " + r.remoteErr + "\n")
+		}
+	}
+}
+
+func (m model) deletingView() string {
+	var b strings.Builder
+	spin := spinnerFrames[m.spinnerFrame%len(spinnerFrames)]
+	b.WriteString(headerStyle.Render(fmt.Sprintf("%s Deleting… (%d/%d)", spin, m.deletesDone(), len(m.results))))
+	b.WriteString("\n\n")
+	for _, r := range m.results {
+		if r.done {
+			writeResultLines(&b, r)
+		} else {
+			b.WriteString(dimStyle.Render("  "+spin+" deleting "+r.name+"…") + "\n")
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render("working — ctrl+c to abort"))
 	b.WriteString("\n")
 	return b.String()
 }
@@ -875,18 +1152,7 @@ func (m model) resultView() string {
 	b.WriteString(headerStyle.Render("Results"))
 	b.WriteString("\n\n")
 	for _, r := range m.results {
-		if r.localOK {
-			b.WriteString(okStyle.Render("  ✓ ") + "deleted local " + r.name + "\n")
-		} else {
-			b.WriteString(errStyle.Render("  ✗ ") + "local " + r.name + ": " + r.localErr + "\n")
-		}
-		if r.remoteTried {
-			if r.remoteOK {
-				b.WriteString(okStyle.Render("  ✓ ") + "deleted remote " + r.name + "\n")
-			} else {
-				b.WriteString(errStyle.Render("  ✗ ") + "remote " + r.name + ": " + r.remoteErr + "\n")
-			}
-		}
+		writeResultLines(&b, r)
 	}
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("press q/enter to quit"))
@@ -894,7 +1160,42 @@ func (m model) resultView() string {
 	return b.String()
 }
 
+// versionString reports the build's commit and date using Go's automatic VCS
+// stamping (populated when built with `go build` inside the repo). Fields fall
+// back to "unknown" when build info is unavailable (e.g. `go run`).
+func versionString() string {
+	commit, date, goVer, dirty := "unknown", "unknown", "unknown", false
+	if info, ok := debug.ReadBuildInfo(); ok {
+		goVer = info.GoVersion
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				commit = s.Value
+			case "vcs.time":
+				date = s.Value
+			case "vcs.modified":
+				dirty = s.Value == "true"
+			}
+		}
+	}
+	if len(commit) > 7 { // shorten a real SHA; the "unknown" fallback is 7 chars
+		commit = commit[:7]
+	}
+	if dirty {
+		commit += " (dirty)"
+	}
+	return fmt.Sprintf("git_pruner\n  commit: %s\n  date:   %s\n  go:     %s", commit, date, goVer)
+}
+
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "version", "--version", "-v":
+			fmt.Println(versionString())
+			return
+		}
+	}
+
 	m, err := initialModel()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "git_pruner:", err)
