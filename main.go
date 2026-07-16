@@ -367,6 +367,19 @@ func (m *model) clampCursor() {
 	m.adjustScroll()
 }
 
+// scroll applies a mouse-wheel step (delta of -1 up / +1 down) to whichever
+// scrollable view is active; other states ignore the wheel.
+func (m *model) scroll(delta int) {
+	switch m.state {
+	case stateList:
+		m.cursor += delta
+		m.clampCursor()
+	case stateDiff:
+		m.diffTop += delta * 3 // 3 lines per wheel notch, like a pager
+		m.clampDiff()
+	}
+}
+
 func (m *model) visibleRows() int {
 	return max(1, m.height-5) // minus header (2) + footer (3)
 }
@@ -448,6 +461,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == stateDeleting {
 			m.spinnerFrame++
 			return m, spinnerTickCmd()
+		}
+		return m, nil
+	case tea.MouseMsg:
+		// Handle the wheel ourselves so it scrolls the active view rather than
+		// the terminal translating it into arrow-key bursts that leak between views.
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.scroll(-1)
+		case tea.MouseButtonWheelDown:
+			m.scroll(1)
 		}
 		return m, nil
 	case tea.KeyMsg:
@@ -1201,7 +1224,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "git_pruner:", err)
 		os.Exit(1)
 	}
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "git_pruner:", err)
 		os.Exit(1)

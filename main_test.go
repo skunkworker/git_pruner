@@ -507,6 +507,44 @@ func TestRemoteMergedIndicator(t *testing.T) {
 	}
 }
 
+// Scrolling the diff view with the wheel must not disturb the list's cursor or
+// scroll position (regression: over-scrolling the diff jumped the list to the end).
+func TestWheelScrollDoesNotLeakBetweenViews(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Park the list cursor at a non-zero row.
+	m.cursor = 2
+	m.clampCursor()
+	savedCursor, savedTop := m.cursor, m.top
+
+	// Enter the diff with scrollable content and scroll it hard past the bottom.
+	m.state = stateDiff
+	m.diffLines = make([]string, 200)
+	m.diffTop = 0
+	for range 500 {
+		m.scroll(1)
+	}
+	if m.diffTop == 0 {
+		t.Fatal("diff should have scrolled down")
+	}
+	if m.cursor != savedCursor || m.top != savedTop {
+		t.Fatalf("diff scroll leaked into list: cursor %d->%d, top %d->%d",
+			savedCursor, m.cursor, savedTop, m.top)
+	}
+
+	// Back in the list, the wheel drives the cursor (routed via Update/MouseMsg).
+	m.state = stateList
+	nm, _ := m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+	if got := nm.(model).cursor; got != savedCursor+1 {
+		t.Fatalf("list wheel should move cursor to %d, got %d", savedCursor+1, got)
+	}
+}
+
 // The version string is well-formed even when VCS build info is absent.
 func TestVersionString(t *testing.T) {
 	s := versionString()
