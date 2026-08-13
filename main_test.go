@@ -1,12 +1,16 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // key builds a rune KeyMsg (e.g. "y", "R") for driving update handlers in tests.
@@ -542,6 +546,224 @@ func TestWheelScrollDoesNotLeakBetweenViews(t *testing.T) {
 	nm, _ := m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
 	if got := nm.(model).cursor; got != savedCursor+1 {
 		t.Fatalf("list wheel should move cursor to %d, got %d", savedCursor+1, got)
+	}
+}
+
+var ansiRe = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+func stripANSI(s string) string { return ansiRe.ReplaceAllString(s, "") }
+
+// truncate measures terminal cells, so multibyte text must never be sliced
+// mid-rune (which emitted invalid UTF-8) and wide characters must not overflow.
+func TestTruncateDisplayWidth(t *testing.T) {
+	for _, w := range []int{1, 4, 9, 10, 11, 40} {
+		for _, s := range []string{"日本語のコミットです", "feat: 🚀 ship it", "feature/café", "plain-ascii"} {
+			got := truncate(s, w)
+			if !utf8.ValidString(got) {
+				t.Fatalf("truncate(%q, %d) = %q: invalid UTF-8", s, w, got)
+			}
+			if cells := ansi.StringWidth(got); cells > w {
+				t.Fatalf("truncate(%q, %d) = %q: %d cells, over budget", s, w, got, cells)
+			}
+		}
+	}
+	if got := truncate("plain-ascii", 40); got != "plain-ascii" {
+		t.Fatalf("short strings must pass through unchanged, got %q", got)
+	}
+}
+
+// pad must align on display cells; wide glyphs otherwise push later columns.
+func TestPadDisplayWidth(t *testing.T) {
+	for _, s := range []string{"日本語", "ab", "🚀", ""} {
+		if got := ansi.StringWidth(pad(s, 10)); got != 10 {
+			t.Fatalf("pad(%q, 10) is %d cells, want 10", s, got)
+		}
+	}
+}
+
+// Every track value must occupy the same column width, or the columns after it
+// shift on gone rows (regression: "gone" was 8 wide where others were 10).
+func TestTrackColumnAlignment(t *testing.T) {
+	m := model{width: 120}
+	rows := []branch{
+		{name: "aaa", upstream: "origin/aaa", ahead: 2, behind: 1},
+		{name: "bbb", upstream: "origin/bbb", gone: true},
+		{name: "ccc"},
+		{name: "ddd", upstream: "origin/ddd", remoteMerged: true},
+	}
+	want := -1
+	for _, br := range rows {
+		m.branches = []branch{br}
+		plain := stripANSI(m.renderRow(0, 10))
+		at := strings.Index(plain, "0001-Jan-01") // the column right after track
+		if at < 0 {
+			t.Fatalf("date column missing for %q: %q", br.name, plain)
+		}
+		// Compare display cells, not the byte offset: the arrows in the track
+		// column are multibyte, which is the whole point of this alignment.
+		cells := ansi.StringWidth(plain[:at])
+		if want == -1 {
+			want = cells
+		} else if cells != want {
+			t.Fatalf("branch %q: date column at cell %d, want %d (track width differs)\n%q",
+				br.name, cells, want, plain)
+		}
+	}
+}
+
+// The core safety fix: a gone branch holding commits that are not in the base
+// is force-deleted with -D, so it must be measured, warned about on the confirm
+// screen, and left out of `p`'s auto-selection.
+func TestGoneBranchWithUnpushedCommitsIsGuarded(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	// feature/tracked is pushed; add a commit that never reaches the remote,
+	// then delete the remote branch and prune so it goes "gone".
+	git(t, repo, "checkout", "-q", "feature/tracked")
+	if err := os.WriteFile(repo+"/unpushed", []byte("irreplaceable"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repo, "add", "unpushed")
+	git(t, repo, "commit", "-qm", "unpushed work")
+	git(t, repo, "checkout", "-q", "main")
+	git(t, repo, "push", "-q", "origin", "--delete", "feature/tracked")
+	git(t, repo, "fetch", "-q", "--all", "--prune")
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb := find(m.branches, "feature/tracked")
+	if tb == nil || !tb.gone {
+		t.Fatalf("feature/tracked should be gone: %+v", tb)
+	}
+	if tb.ahead != 0 {
+		t.Fatalf("precondition: git reports no ahead count for gone branches, got %d", tb.ahead)
+	}
+	if tb.riskCommits == 0 {
+		t.Fatal("gone branch with unpushed commits must report riskCommits > 0")
+	}
+
+	// The confirm screen must name the cost before anything is deleted.
+	tb.selected = true
+	m.state = stateConfirm
+	out := stripANSI(m.confirmView())
+	if !strings.Contains(out, "force delete (-D) will discard them") {
+		t.Fatalf("confirm view must warn about discarded commits:\n%s", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("%d commit(s) not in", tb.riskCommits)) {
+		t.Fatalf("confirm view must state the commit count:\n%s", out)
+	}
+
+	// `p` must not auto-select it: discarding those commits stays deliberate.
+	for i := range m.branches {
+		m.branches[i].selected = false
+	}
+	nm, _ := m.Update(fetchDoneMsg{})
+	after := nm.(model)
+	if b := find(after.branches, "feature/tracked"); b == nil || b.selected {
+		t.Fatalf("gone branch holding unique commits must not be auto-selected: %+v", b)
+	}
+	if !strings.Contains(after.status, "hold commits not in") {
+		t.Fatalf("status should report the skipped branches, got %q", after.status)
+	}
+}
+
+// A gone branch whose work is already in the base carries no risk, so `p` still
+// auto-selects it — the headline prune workflow must stay one keystroke.
+func TestGoneMergedBranchStillAutoSelected(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	// feature/tracked's tip is already an ancestor of main's content here: reset
+	// it to main, push, then delete the remote branch and prune.
+	git(t, repo, "branch", "-f", "feature/tracked", "main")
+	git(t, repo, "push", "-qf", "origin", "feature/tracked")
+	git(t, repo, "push", "-q", "origin", "--delete", "feature/tracked")
+	git(t, repo, "fetch", "-q", "--all", "--prune")
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := find(m.branches, "feature/tracked"); b == nil || !b.gone || b.riskCommits != 0 {
+		t.Fatalf("merged gone branch should carry no risk: %+v", b)
+	}
+	nm, _ := m.Update(fetchDoneMsg{})
+	after := nm.(model)
+	if b := find(after.branches, "feature/tracked"); b == nil || !b.selected {
+		t.Fatalf("risk-free gone branch should still be auto-selected: %+v", b)
+	}
+	if !strings.Contains(after.status, "press d to prune") {
+		t.Fatalf("status should offer the prune, got %q", after.status)
+	}
+}
+
+// riskCommitCount uses patch-equivalence, so a cherry-picked commit already in
+// the base is not counted as work at risk.
+func TestRiskCommitCountIgnoresCherryPicked(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	git(t, repo, "checkout", "-q", "-b", "picked", "main")
+	if err := os.WriteFile(repo+"/p", []byte("p"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repo, "add", "p")
+	git(t, repo, "commit", "-qm", "portable change")
+	git(t, repo, "checkout", "-q", "main")
+	git(t, repo, "cherry-pick", "picked")
+
+	if n := riskCommitCount("picked", "main"); n != 0 {
+		t.Fatalf("cherry-picked commit should not count as at risk, got %d", n)
+	}
+	if n := riskCommitCount("feature/unmerged", "main"); n != 1 {
+		t.Fatalf("genuinely unmerged commit should count, got %d", n)
+	}
+	// No base to compare against means nothing can be asserted about risk.
+	if n := riskCommitCount("picked", ""); n != 0 {
+		t.Fatalf("empty base should yield 0, got %d", n)
+	}
+}
+
+// Merge info must resolve on repos whose only remote is not named "origin";
+// previously remoteDefault() returned "" and the safety indicators vanished.
+func TestNonOriginRemoteResolves(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	// Rename origin -> upstream, leaving no remote called "origin".
+	git(t, repo, "remote", "rename", "origin", "upstream")
+	git(t, repo, "fetch", "-q", "--all", "--prune")
+
+	if got := remoteDefault(); got != "upstream/main" {
+		t.Fatalf("remoteDefault should resolve upstream/main, got %q", got)
+	}
+	if got := baseBranch("feature/unmerged"); got != "upstream/main" {
+		t.Fatalf("baseBranch should use the non-origin remote, got %q", got)
+	}
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.remoteDefault != "upstream/main" || m.riskBase != "upstream/main" {
+		t.Fatalf("model should cache the resolved default: %q / %q", m.remoteDefault, m.riskBase)
+	}
+}
+
+// origin is preferred when several remotes are configured.
+func TestRemotesPrefersOrigin(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	git(t, repo, "remote", "add", "aaa-fork", repo)
+	got := remotes()
+	if len(got) == 0 || got[0] != "origin" {
+		t.Fatalf("origin should sort first, got %v", got)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want both remotes, got %v", got)
 	}
 }
 
