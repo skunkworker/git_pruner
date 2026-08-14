@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The tests drive a real git binary against throwaway repos, so the runner
+      # needs a committer identity and a predictable default branch name.
+      - name: Configure git
+        run: |
+          git config --global user.name  "CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race ./...
+
+      # Exercise the no-sudo path of the installer end to end so it cannot rot.
+      - name: install.sh
+        run: |
+          ./install.sh --bindir "$RUNNER_TEMP/bin"
+          "$RUNNER_TEMP/bin/git_pruner" version

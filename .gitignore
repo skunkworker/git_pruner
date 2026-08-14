@@ -1,0 +1,3 @@
+# `go build ./...` drops the binary in the repo root; the Makefile installs to
+# $(BINDIR) instead.
+/git_pruner

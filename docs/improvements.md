@@ -1,0 +1,141 @@
+# git_pruner — analysis and improvement roadmap
+
+A deep review of the codebase (2026-07-26), the fixes that came out of it, and the work that
+remains. Each finding was reproduced in a throwaway repository before being recorded here;
+findings that did **not** survive testing are listed at the bottom so they are not re-litigated.
+
+## Design assessment
+
+The safety model is the strongest part of this codebase and should be preserved as it evolves:
+
+- a confirmation screen that itemizes every branch before anything is deleted
+- a deliberate `y` (local) vs `R` (local + remote) split, so remote deletion is never one
+  accidental keystroke
+- `-d` → `-D` escalation via an explicit prompt rather than silent forcing
+- merge status computed from local remote-tracking refs, so it needs no network
+- deletions run off the update loop with a live per-branch checklist
+
+The findings below are mostly about places where that model had a gap, not about its design.
+
+---
+
+## Completed
+
+### Tier 1 (all done)
+
+**1. Gone branches could silently discard unpushed commits.** *(the significant one)*
+
+`%(upstream:track)` reports a bare `[gone]` with **no ahead count**, so `branch.ahead` parsed to
+`0`. The chain: `p` auto-selected every gone branch → `confirmView`'s unmerged warning was gated
+on `!br.gone && br.ahead > 0` and so never fired → `deleteFlag` returned `-D` unconditionally →
+`y` destroyed the commits. The `-d`→`-D` force prompt never fired either, because `-D` succeeds
+on the first try. Every other destructive path in the tool warns; this one — the headline `p`
+workflow — did not.
+
+Reproduced with a branch that was pushed, had its remote deleted, then accumulated local commits:
+
+```
+feature/important [origin/feature/important: gone]   track=[gone]  →  ahead parsed as 0
+git rev-list --count main..feature/important         →  2 commits destroyed, no warning
+```
+
+Fixed by `riskCommitCount`, which measures each gone branch against the default branch. Gone
+branches with no unique commits are still auto-selected by `p` (the one-keystroke workflow is
+intact); ones holding unique commits are left unselected, reported in the status line, and
+flagged on the confirmation screen.
+
+*Why `git cherry` rather than `git rev-list <base>..<branch>`:* both were measured against a
+squash-merged branch, a single-commit squash, and genuinely unmerged work:
+
+| branch    | `rev-list --count` | `git cherry` `+` lines |
+| --------- | ------------------ | ---------------------- |
+| squashed (2 commits → 1) | 2 | 2 |
+| single-commit squash     | 1 | **0** |
+| genuinely unmerged       | 1 | 1 |
+
+`git cherry` is strictly more accurate at the same cost — it recognizes cherry-picked, rebased,
+and singly-squashed work as already integrated. It cannot detect a *group* squash, and nothing
+cheap can. That residual over-report is why the warning is worded `N commit(s) not in <base>`
+rather than claiming the work is unrecoverable.
+
+**2. `truncate` sliced bytes, emitting invalid UTF-8.** `s[:w-1]` split multibyte runes:
+
+```
+truncate("日本語のコミットです", 9)  → "日本\xe8\xaa…"   validUTF8 = false
+truncate("日本語のコミットです", 11) → "日本語\xe3…"     validUTF8 = false
+```
+
+Byte length also is not display width, so wide (CJK/emoji) columns were mis-sized in both
+directions. Fixed with `ansi.Truncate` plus a new `pad` helper; `recomputeNameWidth` now measures
+cells via `ansi.StringWidth`.
+
+**3. The `gone` track value was 8 cells wide where every other value was 10**, shifting every
+column after it on exactly the rows the user is there to act on. The regression test was verified
+to fail against the old code (`date column at cell 31, want 33`) before being kept.
+
+**4. Default-branch resolution hardcoded `origin`.** On a repo whose only remote was `upstream`,
+`remoteDefault()` returned `""` and the `✓ merged` indicator plus the confirm-screen merge line
+silently vanished — no error, the safety signal simply was not there. `remotes()` now tries every
+configured remote with `origin` ordered first.
+
+### Also completed
+
+- `LICENSE` (MIT)
+- `.github/workflows/ci.yml` — gofmt, `go build`, `go vet`, `go test -race` on Linux and macOS
+- `.gitignore` — `go build ./...` drops a binary in the repo root
+
+---
+
+## Remaining work
+
+### Tier 2 — robustness
+
+**5. Blocking git calls inside `Update`.** `loadDiff` (`v`), `refreshMergeInfo`, and
+`reloadBranches` run synchronously in the update loop. `git branch -r --merged` is
+O(remote refs × history) and runs on *every* reload; on a repo with thousands of remote branches
+the UI freezes. The `tea.Cmd` pattern already works for fetch — reuse it. Note that
+`refreshMergeInfo` now also issues one `git cherry` per gone branch, which raises the stakes.
+
+**6. `runGit` has no timeout and does not disable terminal prompts.** `fetch --all --prune` and
+`push --delete` are network-bound; a credential or SSH prompt hangs the TUI with no recovery.
+Set `GIT_TERMINAL_PROMPT=0` and attach a `context.WithTimeout` so it fails fast instead.
+
+**7. The tested delete path is not the one users run.** `performDeletions` is test-only by its own
+comment; the live async path's completion logic — `branchDeletedMsg` → `deletesDone` → the
+`stateForcePrompt` / `stateResult` transition — is never fed through `Update` in any test. The
+riskiest state machine in the program is the untested one. Port the tests to the async path and
+delete `performDeletions`.
+
+**8. Smaller items.**
+- `listView` runs one line over terminal height when `status` and `err` are both set
+  (`visibleRows` is `height-5`; actual emission is `height+1`).
+- ANSI and control characters in commit subjects and branch names render raw into the terminal.
+- `applyBranches` silently discards the user's existing selections on `p`.
+- `stateDeleting`'s ctrl+c quits while `git push --delete` children are still running.
+
+### Tier 3 — features for the tool's actual job
+
+**9. `/` incremental filter.** With dozens of branches there is currently no way to narrow the
+list — the single biggest UX gap for the repos this tool exists to clean up.
+
+**10. Bulk-select predicates** (merged, older than N days). "Select everything merged and older
+than 90 days" is the canonical prune workflow and currently has to be done by hand.
+
+**11. Reflog recovery hint after a `-D`.** The force-prompt screen says "permanently discard their
+unmerged commits" without telling the user that `git reflog` can still recover them. Pairs
+naturally with finding 1.
+
+### Tier 4 — hygiene
+
+**12. Split `main.go`** (~1,300 lines) into `git.go` / `model.go` / `view.go`.
+
+**13. Make the Makefile's `BINDIR` overridable** — it hardcodes `$HOME/shared/bin`.
+
+---
+
+## Investigated and rejected
+
+**Concurrent `git branch -d` racing on `packed-refs.lock`.** `tea.Batch` runs deletions
+concurrently, which looked like it should collide on the packed-refs lock. Tested with 60 parallel
+deletes against a freshly packed repo: **all 60 succeeded.** Git's ref-lock retry handles it. No
+change needed — recorded so it is not re-investigated.

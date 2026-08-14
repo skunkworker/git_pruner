@@ -1,5 +1,7 @@
 BINARY := git_pruner
-BINDIR := $(HOME)/shared/bin
+# Overridable so `make build/clean BINDIR=...` can target the same directory
+# install.sh used; the default is the local dev convention.
+BINDIR ?= $(HOME)/shared/bin
 TARGET := $(BINDIR)/$(BINARY)
 
 .PHONY: build install test vet clean
