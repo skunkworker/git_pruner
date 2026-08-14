@@ -8,6 +8,12 @@ matching remote branch.
 You can also view a branch's changes as a colorized diff, and fetch-and-prune to find branches
 whose upstream has been deleted so they can be cleaned up in one step.
 
+![git_pruner: prune gone branches, arm a remote deletion, confirm, delete](assets/demo.gif)
+
+Above: `p` fetches and prunes, marking three branches whose upstream was deleted and selecting
+them; `space` and `r` add a merged branch and arm its remote deletion too; `d` opens the
+confirmation, where `R` deletes local **and** remote.
+
 ## Install
 
 Requires Go 1.26+ and git on your PATH.
@@ -64,6 +70,8 @@ In the diff view: `↑`/`↓` scroll, `space`/`ctrl+d` page down, `ctrl+u`/`pgup
 `g`/`G` jump to top/bottom, and `q`/`esc`/`v` return to the list.
 
 ## Row format
+
+![The branch list: selection, track and merge columns, dates, hashes and subjects](assets/branches.png)
 
 ```
 > [x] R *  feature/foo        ↑2↓1 ✓  3 days ago   a1b2c3d  Fix the thing
@@ -144,10 +152,19 @@ make build      # build straight to $BINDIR (default ~/shared/bin), skipping ins
 make test       # go test ./...
 make vet        # go vet ./...
 make clean      # remove the binary from $BINDIR
+make assets     # re-record the README's demo GIF and screenshot (needs vhs)
 ```
 
 CI runs `gofmt`, `go build`, `go vet`, and `go test -race` on Linux and macOS for every push to
 `master` and every pull request (`.github/workflows/ci.yml`).
+
+The README's `assets/demo.gif` and `assets/branches.png` are generated, not hand-captured — rerun
+`make assets` (needs [vhs](https://github.com/charmbracelet/vhs): `brew install vhs`) after any
+change to the UI. It builds a throwaway repo under `/tmp/git_pruner-demo` with branches in every
+interesting state — merged, stale upstream, unmerged work, no upstream — then records both assets
+against that one repo so their commit hashes agree. The two tapes share their terminal settings
+and setup via `assets/common.tape`, since the GIF and the still sit side by side in this file and
+would look mismatched if the width or theme drifted between them.
 
 [`docs/improvements.md`](docs/improvements.md) records the codebase analysis, the reasoning behind
 the current safety behavior, and the roadmap of remaining work.
