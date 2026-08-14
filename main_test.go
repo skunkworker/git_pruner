@@ -59,20 +59,12 @@ func setupRepo(t *testing.T) string {
 	git(t, tmp, "init", "-q", "-b", "main")
 	git(t, tmp, "config", "user.email", "t@t.t")
 	git(t, tmp, "config", "user.name", "t")
-	if err := os.WriteFile(tmp+"/a", []byte("a"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	git(t, tmp, "add", "a")
-	git(t, tmp, "commit", "-qm", "init commit")
+	commitFile(t, tmp, "a", "a")
 	git(t, tmp, "remote", "add", "origin", remote)
 	git(t, tmp, "push", "-q", "-u", "origin", "main")
 	git(t, tmp, "branch", "feature/merged") // merged into main -> safe delete
 	git(t, tmp, "checkout", "-q", "-b", "feature/unmerged")
-	if err := os.WriteFile(tmp+"/b", []byte("b"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	git(t, tmp, "add", "b")
-	git(t, tmp, "commit", "-qm", "wip")
+	commitFile(t, tmp, "b", "b")
 	git(t, tmp, "checkout", "-q", "-b", "feature/tracked")
 	git(t, tmp, "push", "-q", "-u", "origin", "feature/tracked")
 	git(t, tmp, "checkout", "-q", "main")
@@ -222,7 +214,7 @@ func TestSafeDeleteRefusesUnmerged(t *testing.T) {
 
 	var merged, unmerged *deleteResult
 	for i := range m.results {
-		switch m.results[i].name {
+		switch m.results[i].br.name {
 		case "feature/merged":
 			merged = &m.results[i]
 		case "feature/unmerged":
@@ -259,10 +251,10 @@ func TestForceDeleteUnmergedRetry(t *testing.T) {
 	// The refused unmerged branch should be surfaced for a force prompt, with
 	// its ahead count copied onto the result (0 here: it has no upstream).
 	failures := m.forceableFailures()
-	if len(failures) != 1 || failures[0].name != "feature/unmerged" {
+	if len(failures) != 1 || failures[0].br.name != "feature/unmerged" {
 		t.Fatalf("want feature/unmerged in forceableFailures, got %+v", failures)
 	}
-	if failures[0].ahead != 0 {
+	if failures[0].br.ahead != 0 {
 		t.Fatalf("want ahead=0 captured (no upstream), got %+v", failures[0])
 	}
 	if find(m.branches, "feature/unmerged") == nil {
@@ -275,7 +267,7 @@ func TestForceDeleteUnmergedRetry(t *testing.T) {
 		t.Fatalf("no failures should remain after force retry: %+v", m.results)
 	}
 	for _, r := range m.results {
-		if r.name == "feature/unmerged" && (!r.localOK || r.localErr != "") {
+		if r.br.name == "feature/unmerged" && (!r.localOK || r.localErr != "") {
 			t.Fatalf("feature/unmerged should be deleted after force retry: %+v", r)
 		}
 	}
@@ -621,11 +613,7 @@ func TestGoneBranchWithUnpushedCommitsIsGuarded(t *testing.T) {
 	// feature/tracked is pushed; add a commit that never reaches the remote,
 	// then delete the remote branch and prune so it goes "gone".
 	git(t, repo, "checkout", "-q", "feature/tracked")
-	if err := os.WriteFile(repo+"/unpushed", []byte("irreplaceable"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	git(t, repo, "add", "unpushed")
-	git(t, repo, "commit", "-qm", "unpushed work")
+	commitFile(t, repo, "unpushed", "irreplaceable")
 	git(t, repo, "checkout", "-q", "main")
 	git(t, repo, "push", "-q", "origin", "--delete", "feature/tracked")
 	git(t, repo, "fetch", "-q", "--all", "--prune")
@@ -687,8 +675,13 @@ func TestGoneMergedBranchStillAutoSelected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b := find(m.branches, "feature/tracked"); b == nil || !b.gone || b.riskCommits != 0 {
+	b := find(m.branches, "feature/tracked")
+	if b == nil || !b.gone || b.riskCommits != 0 {
 		t.Fatalf("merged gone branch should carry no risk: %+v", b)
+	}
+	// The headline prune must stay warning-free: -D discards nothing here.
+	if w := m.riskWarning(*b); w != "" {
+		t.Fatalf("a gone branch holding nothing unique must not warn: %q", w)
 	}
 	nm, _ := m.Update(fetchDoneMsg{})
 	after := nm.(model)
@@ -707,11 +700,7 @@ func TestRiskCommitCountIgnoresCherryPicked(t *testing.T) {
 	chdir(t, repo)
 
 	git(t, repo, "checkout", "-q", "-b", "picked", "main")
-	if err := os.WriteFile(repo+"/p", []byte("p"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	git(t, repo, "add", "p")
-	git(t, repo, "commit", "-qm", "portable change")
+	commitFile(t, repo, "p", "p")
 	git(t, repo, "checkout", "-q", "main")
 	git(t, repo, "cherry-pick", "picked")
 
@@ -764,6 +753,293 @@ func TestRemotesPrefersOrigin(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("want both remotes, got %v", got)
+	}
+}
+
+// commitFile writes a file on the current branch and commits it.
+func commitFile(t *testing.T, dir, name, body string) {
+	t.Helper()
+	if err := os.WriteFile(dir+"/"+name, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", name)
+	git(t, dir, "commit", "-qm", "add "+name)
+}
+
+// setupDeleteShapes adds one branch for every shape that decides whether
+// `git branch -d` is accepted, so predictions can be checked against real git.
+// setupRepo already supplies the two upstream-less shapes (feature/unmerged and
+// feature/merged), so they are not rebuilt here.
+func setupDeleteShapes(t *testing.T, repo string) {
+	t.Helper()
+	// Upstream, with a local commit the upstream lacks.
+	git(t, repo, "checkout", "-q", "-b", "shape/ahead", "main")
+	git(t, repo, "push", "-q", "-u", "origin", "shape/ahead")
+	commitFile(t, repo, "ahead", "x")
+
+	// Ahead of a live upstream, but merged into HEAD. git consults the upstream
+	// alone whenever it resolves, so it refuses this even though HEAD holds the
+	// work — the case an either-or reading of the two criteria gets wrong.
+	git(t, repo, "checkout", "-q", "-b", "shape/ahead-head-merged", "main")
+	git(t, repo, "push", "-q", "-u", "origin", "shape/ahead-head-merged")
+	commitFile(t, repo, "ahead-head-merged", "x")
+	git(t, repo, "checkout", "-q", "main")
+	git(t, repo, "merge", "-q", "--no-ff", "-m", "merge shape/ahead-head-merged", "shape/ahead-head-merged")
+
+	// Upstream, strictly behind it — an ancestor, so merged into its upstream.
+	git(t, repo, "checkout", "-q", "-b", "shape/behind", "main")
+	git(t, repo, "push", "-q", "-u", "origin", "shape/behind")
+	commitFile(t, repo, "behind", "x")
+	git(t, repo, "push", "-q", "origin", "shape/behind")
+	git(t, repo, "reset", "-q", "--hard", "HEAD~1")
+
+	// Squash-merged into origin/main: different commits, same content, upstream
+	// still present.
+	git(t, repo, "checkout", "-q", "-b", "shape/squashed", "main")
+	commitFile(t, repo, "squashed", "x")
+	git(t, repo, "push", "-q", "-u", "origin", "shape/squashed")
+	git(t, repo, "checkout", "-q", "main")
+	git(t, repo, "merge", "-q", "--squash", "shape/squashed")
+	git(t, repo, "commit", "-qm", "squash shape/squashed")
+	git(t, repo, "push", "-q", "origin", "main")
+
+	git(t, repo, "checkout", "-q", "main")
+	git(t, repo, "fetch", "-q", "--all", "--prune")
+}
+
+// Ground truth: safeDeletable must agree with what `git branch -d` actually does
+// for every branch shape. This is the predicate the confirm-screen warning and
+// the risk measurement both hang off, so a wrong answer here is either a silent
+// delete failure (the reported bug) or a false alarm.
+func TestSafeDeletableMatchesGit(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+	setupDeleteShapes(t, repo)
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]bool{
+		"shape/ahead":             false, // holds a commit its upstream lacks
+		"shape/ahead-head-merged": false, // ditto, and HEAD holding it does not help
+		"shape/behind":            true,  // ancestor of its upstream
+		"shape/squashed":          true,  // equal to its upstream
+		"feature/unmerged":        false, // no upstream, unmerged
+		"feature/merged":          true,  // no upstream, merged into HEAD
+	}
+	for name, expect := range want {
+		b := find(m.branches, name)
+		if b == nil {
+			t.Fatalf("%s missing from the branch list", name)
+		}
+		if b.safeDeletable() != expect {
+			t.Errorf("%s: safeDeletable()=%v want %v (upstream=%q ahead=%d headMerged=%v)",
+				name, b.safeDeletable(), expect, b.upstream, b.ahead, b.headMerged)
+		}
+		// Now ask git itself. Deleting one branch cannot change another's merge
+		// status, so the whole set can be checked in one pass.
+		_, gitErr := runGit("branch", "-d", name)
+		if (gitErr == nil) != expect {
+			t.Errorf("git branch -d %s: err=%v, want accepted=%v", name, gitErr, expect)
+		}
+		if gitErr != nil && !strings.Contains(gitErr.Error(), "not fully merged") {
+			t.Errorf("%s refused for an unexpected reason: %v", name, gitErr)
+		}
+	}
+}
+
+// The reported bug: an unmerged branch with no upstream was deleted with -d and
+// failed, with nothing on the confirm screen having warned about it.
+func TestUnmergedBranchWithoutUpstreamIsWarned(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := find(m.branches, "feature/unmerged")
+	if b == nil || b.upstream != "" || b.ahead != 0 {
+		t.Fatalf("precondition: want an upstream-less branch with ahead=0: %+v", b)
+	}
+	if b.safeDeletable() {
+		t.Fatalf("an unmerged upstream-less branch is not safely deletable: %+v", b)
+	}
+
+	// Drive the real path: 'd' measures the selection's risk, then confirms.
+	b.selected = true
+	nm, _ := m.updateList(key("d"))
+	m = nm.(model)
+	if m.state != stateConfirm {
+		t.Fatalf("'d' should open the confirm screen, got %v", m.state)
+	}
+	b = find(m.branches, "feature/unmerged")
+	if b.riskCommits != 1 {
+		t.Fatalf("want the branch's 1 unique commit measured, got %d", b.riskCommits)
+	}
+	out := stripANSI(m.confirmView())
+	if !strings.Contains(out, "safe delete (-d) will fail") {
+		t.Fatalf("confirm view must warn that -d will be refused:\n%s", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("%d commit(s) not in %s", b.riskCommits, m.riskBase)) {
+		t.Fatalf("confirm view must state what a force would discard:\n%s", out)
+	}
+}
+
+// Negative spec: branches git will happily delete must draw no warning at all,
+// or the confirm screen cries wolf on the ordinary cleanup path.
+func TestNoWarningForSafelyDeletableBranches(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+	setupDeleteShapes(t, repo)
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"feature/merged", "shape/behind", "shape/squashed"} {
+		b := find(m.branches, name)
+		if b == nil {
+			t.Fatalf("%s missing", name)
+		}
+		if w := m.riskWarning(*b); w != "" {
+			t.Errorf("%s deletes cleanly but warned: %q", name, w)
+		}
+		b.selected = true
+	}
+	m.state = stateConfirm
+	// Only the delete-risk lines are asserted on: the separate "not merged into
+	// <default>" indicator is about the remote's state, not about whether the
+	// delete will succeed, and legitimately fires for squash-merged branches.
+	out := stripANSI(m.confirmView())
+	for _, phrase := range []string{"safe delete (-d) will fail", "force delete (-D)", "not fully merged"} {
+		if strings.Contains(out, phrase) {
+			t.Fatalf("confirm view must not warn %q for clean branches:\n%s", phrase, out)
+		}
+	}
+}
+
+// The force prompt asks the user to approve a -D, so it must state what that
+// costs. It used to print the ahead count, which is 0 for exactly the branches
+// that reach the prompt without an upstream — leaving the prompt blank.
+func TestForcePromptStatesCommitCount(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	find(m.branches, "feature/unmerged").selected = true
+	m.force = false
+	m.performDeletions()
+
+	failures := m.forceableFailures()
+	if len(failures) != 1 {
+		t.Fatalf("want one refused delete, got %+v", failures)
+	}
+	if failures[0].br.riskCommits != 1 {
+		t.Fatalf("the refused result must carry its measured cost, got %+v", failures[0])
+	}
+
+	m.state = stateForcePrompt
+	out := stripANSI(m.forcePromptView())
+	if !strings.Contains(out, fmt.Sprintf("1 commit(s) not in %s will be lost", m.riskBase)) {
+		t.Fatalf("force prompt must state the commit count:\n%s", out)
+	}
+}
+
+// The remote copy is the last place unmerged commits survive a refused local
+// delete, so the armed push must be deferred — and then honoured once the force
+// retry actually removes the branch.
+func TestRemoteDeleteDeferredUntilLocalSucceeds(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	// Give feature/tracked a commit its upstream lacks, so -d is refused.
+	git(t, repo, "checkout", "-q", "feature/tracked")
+	commitFile(t, repo, "unpushed", "x")
+	git(t, repo, "checkout", "-q", "main")
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb := find(m.branches, "feature/tracked")
+	if tb == nil || tb.ahead != 1 {
+		t.Fatalf("precondition: feature/tracked should be ahead 1: %+v", tb)
+	}
+	tb.selected = true
+	tb.deleteRemote = true
+	m.force = false // safe delete, which git will refuse
+	m.performDeletions()
+
+	r := m.results[0]
+	if r.localOK {
+		t.Fatalf("safe delete should have been refused: %+v", r)
+	}
+	if r.remoteTried {
+		t.Fatalf("the remote must not be touched while the local branch survives: %+v", r)
+	}
+	if !r.remoteSkipped {
+		t.Fatalf("the deferred push must be recorded: %+v", r)
+	}
+	if !remoteHasBranch(t, repo, "feature/tracked") {
+		t.Fatal("remote feature/tracked must survive a refused local delete")
+	}
+	if out := stripANSI(m.resultView()); !strings.Contains(out, "kept remote origin/feature/tracked") {
+		t.Fatalf("results must explain the kept remote:\n%s", out)
+	}
+
+	// The force retry clears the branch, so the arming is finally honoured.
+	m.forceDeleteUnmerged()
+	r = m.results[0]
+	if !r.localOK || !r.remoteTried || !r.remoteOK || r.remoteSkipped {
+		t.Fatalf("force retry should complete both deletes: %+v", r)
+	}
+	if remoteHasBranch(t, repo, "feature/tracked") {
+		t.Fatal("remote feature/tracked should be deleted after the force retry")
+	}
+}
+
+// Negative spec: a delete refused for any reason other than unmerged commits
+// cannot be rescued by -D, so it must not raise the force prompt — which would
+// both mislabel the cause and offer a retry that fails identically.
+func TestNonUnmergedFailureIsNotForceable(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	// A second worktree holds feature/unmerged; git refuses to delete it under
+	// -d and -D alike.
+	wt := t.TempDir() + "/wt"
+	git(t, repo, "worktree", "add", "-q", wt, "feature/unmerged")
+
+	if _, err := runGit("branch", "-D", "feature/unmerged"); err == nil {
+		t.Fatal("precondition: -D should also fail for a branch held by a worktree")
+	}
+
+	b := branch{name: "feature/unmerged"}
+	res := deleteBranch(b, "-d", false)
+	if res.localOK {
+		t.Fatalf("delete should have failed: %+v", res)
+	}
+	if res.forceable {
+		t.Fatalf("a worktree conflict must not be offered as force-retryable: %q", res.localErr)
+	}
+
+	// End to end: the async path lands on the results screen, not the prompt.
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.results = []deleteResult{{br: branch{name: "feature/unmerged"}}}
+	m.state = stateDeleting
+	msg := deleteBranchCmd(0, *find(m.branches, "feature/unmerged"), "-d", false)()
+	nm, _ := m.Update(msg)
+	if got := nm.(model).state; got != stateResult {
+		t.Fatalf("state should be stateResult, got %v", got)
 	}
 }
 

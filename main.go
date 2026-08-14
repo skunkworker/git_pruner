@@ -28,7 +28,9 @@ type branch struct {
 	behind       int
 	gone         bool // upstream was configured but no longer exists
 	remoteMerged bool // upstream is merged into the remote default branch (safe to delete)
+	headMerged   bool // branch tip is merged into HEAD (git's -d criterion when there is no upstream)
 	riskCommits  int  // commits whose patch is not in the base branch; -D discards them
+	riskMeasured bool // riskCommits has been computed (0 is a meaningful value)
 	isCurrent    bool
 	selected     bool
 	deleteRemote bool
@@ -47,6 +49,26 @@ func (b branch) remoteBranch() string {
 	}
 	return b.name
 }
+
+// safeDeletable reports whether `git branch -d` will accept b, mirroring git's
+// rule: a resolvable upstream is the sole criterion (ahead == 0 means the branch
+// holds no commit the upstream lacks), and HEAD is consulted only when there is
+// no upstream to ask. This is a precedence, not an either-or — git refuses a
+// branch ahead of its upstream even when HEAD already contains it. Note that a
+// branch with no upstream always has ahead == 0, git reporting no track info for
+// it, so ahead alone cannot answer this.
+func (b branch) safeDeletable() bool {
+	if b.upstream != "" && !b.gone {
+		return b.ahead == 0
+	}
+	return b.headMerged
+}
+
+// forcedDelete reports whether b will be deleted with -D rather than -d. Gone
+// branches always are: git reports no track info for them, so a safe delete
+// would turn on HEAD alone and refuse branches whose work is in the remote
+// default but not in the local checkout — the headline prune case.
+func (b branch) forcedDelete(force bool) bool { return force || b.gone }
 
 type sortField int
 
@@ -82,15 +104,18 @@ const (
 )
 
 type deleteResult struct {
-	name        string
-	ahead       int  // commits the branch was ahead of upstream (for the force prompt)
-	done        bool // the async deletion for this branch has completed
+	br          branch // the branch this deletion was run for
+	done        bool   // the async deletion for this branch has completed
 	localOK     bool
 	localErr    string
 	forceable   bool // a safe (-d) delete failed and could be retried with -D
 	remoteTried bool
 	remoteOK    bool
 	remoteErr   string
+	// remoteSkipped records that the armed push was deliberately deferred
+	// because the local delete failed — the one piece of state not derivable
+	// from br, since arming is the caller's decision.
+	remoteSkipped bool
 }
 
 type model struct {
@@ -150,6 +175,10 @@ var (
 
 func runGit(args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
+	// Pin the locale: deleteBranch classifies failures by matching git's own
+	// error text, which gettext would otherwise translate. Everything else we
+	// parse is --format-driven and unaffected.
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	var out, errBuf strings.Builder
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf
@@ -293,15 +322,11 @@ func riskCommitCount(name, base string) int {
 	return n
 }
 
-// remoteMergedSet returns the set of remote-tracking branches (short names, e.g.
-// "origin/feature") whose tip is merged into def. Operates on local
-// remote-tracking refs, so it needs no network — it reflects the last fetch.
-func remoteMergedSet(def string) map[string]bool {
+// mergedSet runs a `git branch --merged` query and collects the short ref names
+// it reports into a set.
+func mergedSet(args ...string) map[string]bool {
 	set := map[string]bool{}
-	if def == "" {
-		return set
-	}
-	out, err := runGit("branch", "-r", "--merged", def, "--format=%(refname:short)")
+	out, err := runGit(append(args, "--format=%(refname:short)")...)
 	if err != nil {
 		return set
 	}
@@ -312,6 +337,21 @@ func remoteMergedSet(def string) map[string]bool {
 	}
 	return set
 }
+
+// remoteMergedSet returns the set of remote-tracking branches (short names, e.g.
+// "origin/feature") whose tip is merged into def. Operates on local
+// remote-tracking refs, so it needs no network — it reflects the last fetch.
+func remoteMergedSet(def string) map[string]bool {
+	if def == "" {
+		return map[string]bool{}
+	}
+	return mergedSet("branch", "-r", "--merged", def)
+}
+
+// localMergedSet returns the local branches whose tip is merged into HEAD —
+// git's criterion for accepting `branch -d` on a branch with no upstream. One
+// git call covers the whole list, so this costs nothing per branch.
+func localMergedSet() map[string]bool { return mergedSet("branch", "--merged", "HEAD") }
 
 // fetchDoneMsg reports completion of an async `git fetch --all --prune`.
 type fetchDoneMsg struct{ err error }
@@ -344,8 +384,7 @@ var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 // independently and concurrently under tea.Batch.
 func deleteBranchCmd(idx int, b branch, flag string, wantRemote bool) tea.Cmd {
 	return func() tea.Msg {
-		res := deleteBranch(b.name, flag, wantRemote, b.remoteName(), b.remoteBranch(), b.ahead)
-		return branchDeletedMsg{idx: idx, res: res}
+		return branchDeletedMsg{idx: idx, res: deleteBranch(b, flag, wantRemote)}
 	}
 }
 
@@ -639,6 +678,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.state = stateHelp
 	case "d", "enter":
 		if len(m.selectedBranches()) > 0 {
+			m.measureSelectedRisk() // the confirm screen states what each delete costs
 			m.state = stateConfirm
 		}
 	}
@@ -684,6 +724,7 @@ func (m model) armedRemoteCount() int {
 // per branch (which run concurrently) plus the spinner tick. Remote branches are
 // pushed --delete only when includeRemote is set (see updateConfirm).
 func (m *model) startDeletions(includeRemote bool) tea.Cmd {
+	m.measureSelectedRisk() // results carry the cost through to the force prompt
 	sel := m.selectedBranches()
 	m.results = make([]deleteResult, len(sel))
 	m.spinnerFrame = 0
@@ -691,7 +732,7 @@ func (m *model) startDeletions(includeRemote bool) tea.Cmd {
 
 	cmds := []tea.Cmd{spinnerTickCmd()}
 	for i, b := range sel {
-		m.results[i] = deleteResult{name: b.name, ahead: b.ahead}
+		m.results[i] = deleteResult{br: b}
 		wantRemote := includeRemote && b.deleteRemote && b.upstream != ""
 		cmds = append(cmds, deleteBranchCmd(i, b, b.deleteFlag(m.force), wantRemote))
 	}
@@ -765,10 +806,9 @@ func (m model) updateDiff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// deleteFlag returns the git branch delete flag for b under the given force mode:
-// -D for forced or gone branches (which -d refuses), -d otherwise.
+// deleteFlag returns the git branch delete flag for b under the given force mode.
 func (b branch) deleteFlag(force bool) string {
-	if force || b.gone {
+	if b.forcedDelete(force) {
 		return "-D"
 	}
 	return "-d"
@@ -777,34 +817,52 @@ func (b branch) deleteFlag(force bool) string {
 // deleteBranch runs one branch's local delete and, when wantRemote is set, its
 // remote-branch push --delete. It is the single worker shared by the synchronous
 // performDeletions path and the asynchronous deleteBranchCmd path.
-func deleteBranch(name, flag string, wantRemote bool, remoteName, remoteBranch string, ahead int) deleteResult {
-	res := deleteResult{name: name, ahead: ahead, done: true}
-	if _, err := runGit("branch", flag, name); err != nil {
+func deleteBranch(b branch, flag string, wantRemote bool) deleteResult {
+	res := deleteResult{br: b, done: true}
+	if _, err := runGit("branch", flag, b.name); err != nil {
 		res.localErr = err.Error()
-		res.forceable = flag == "-d" // a refused safe delete can be retried with -D
+		// Only an unmerged refusal is worth escalating to -D. Other failures — a
+		// branch held by another worktree, most commonly — fail identically under
+		// -D, so offering the retry would just mislabel them as lost commits.
+		res.forceable = flag == "-d" && strings.Contains(res.localErr, "not fully merged")
 	} else {
 		res.localOK = true
 	}
-	if wantRemote {
-		res.remoteTried = true
-		if _, err := runGit("push", remoteName, "--delete", remoteBranch); err != nil {
-			res.remoteErr = err.Error()
-		} else {
-			res.remoteOK = true
-		}
+	// Never delete the remote copy while the local branch survives a refused
+	// delete: that would strand its commits with nowhere else to exist. The push
+	// is deferred until the force retry clears the local branch.
+	switch {
+	case !wantRemote:
+	case res.localOK:
+		pushRemoteDelete(&res)
+	default:
+		res.remoteSkipped = true
 	}
 	return res
+}
+
+// pushRemoteDelete deletes res's remote branch, clearing any deferral: the
+// results screen tests remoteSkipped first, so a stale flag would report the
+// remote as kept right after a successful push.
+func pushRemoteDelete(res *deleteResult) {
+	res.remoteSkipped = false
+	res.remoteTried = true
+	if _, err := runGit("push", res.br.remoteName(), "--delete", res.br.remoteBranch()); err != nil {
+		res.remoteErr = err.Error()
+	} else {
+		res.remoteOK = true
+	}
 }
 
 // performDeletions deletes the selected branches synchronously. The interactive
 // UI uses the async startDeletions path instead; this remains for tests and as
 // the straightforward equivalent.
 func (m *model) performDeletions() {
+	m.measureSelectedRisk()
 	m.results = nil
 	for _, b := range m.selectedBranches() {
 		wantRemote := b.deleteRemote && b.upstream != ""
-		res := deleteBranch(b.name, b.deleteFlag(m.force), wantRemote, b.remoteName(), b.remoteBranch(), b.ahead)
-		m.results = append(m.results, res)
+		m.results = append(m.results, deleteBranch(b, b.deleteFlag(m.force), wantRemote))
 	}
 	m.reloadBranches()
 }
@@ -831,11 +889,12 @@ func (m *model) reloadBranches() {
 }
 
 // refreshMergeInfo caches the remote default branch, marks each branch whose
-// upstream is merged into it, and measures what a force delete would discard
-// for gone branches. Call after every branch (re)load.
+// upstream is merged into it or whose tip is merged into HEAD, and measures what
+// deleting it would cost. Call after every branch (re)load.
 func (m *model) refreshMergeInfo() {
 	m.remoteDefault = remoteDefault()
 	merged := remoteMergedSet(m.remoteDefault)
+	headMerged := localMergedSet()
 
 	m.riskBase = m.remoteDefault
 	if m.riskBase == "" {
@@ -845,11 +904,35 @@ func (m *model) refreshMergeInfo() {
 	for i := range m.branches {
 		b := &m.branches[i]
 		b.remoteMerged = b.upstream != "" && merged[b.upstream]
-		// Gone branches are always deleted with -D, and git reports no ahead
-		// count for them, so this is the only measure of what deletion costs.
-		// One git call per gone branch; gone branches are typically few.
+		b.headMerged = headMerged[b.name]
+		b.riskMeasured = false // the branch was just reloaded; any old count is stale
+		// Only gone branches are measured up front, because `p` consults the count
+		// to decide what it may auto-select. The rest wait for measureSelectedRisk:
+		// riskCommitCount is a subprocess per branch, and running it for every
+		// unmergeable branch here cost a second of startup on a repo with dozens.
 		if b.gone {
-			b.riskCommits = riskCommitCount(b.name, m.riskBase)
+			m.measureRisk(b)
+		}
+	}
+}
+
+// measureRisk fills in b's cost-of-deletion count, once per (re)load.
+func (m *model) measureRisk(b *branch) {
+	if b.riskMeasured {
+		return
+	}
+	b.riskCommits = riskCommitCount(b.name, m.riskBase)
+	b.riskMeasured = true
+}
+
+// measureSelectedRisk measures what deleting each selected branch would cost.
+// Call before any view that reports the cost: only branches a safe delete would
+// refuse are measured, since those are the ones deleted with -D.
+func (m *model) measureSelectedRisk() {
+	for i := range m.branches {
+		b := &m.branches[i]
+		if b.selected && (b.gone || !b.safeDeletable()) {
+			m.measureRisk(b)
 		}
 	}
 }
@@ -863,11 +946,16 @@ func (m *model) forceDeleteUnmerged() {
 		if r.localOK || !r.forceable {
 			continue
 		}
-		if _, err := runGit("branch", "-D", r.name); err != nil {
+		if _, err := runGit("branch", "-D", r.br.name); err != nil {
 			r.localErr = err.Error()
-		} else {
-			r.localOK = true
-			r.localErr = ""
+			continue
+		}
+		r.localOK = true
+		r.localErr = ""
+		// The armed remote delete was deferred while the local branch survived;
+		// now that it is gone, honour what the user confirmed.
+		if r.remoteSkipped {
+			pushRemoteDelete(r)
 		}
 	}
 	m.reloadBranches()
@@ -1188,14 +1276,8 @@ func (m model) confirmView() string {
 		if br.deleteRemote && br.upstream != "" {
 			b.WriteString("      " + errStyle.Render(fmt.Sprintf("+ delete remote %s/%s", br.remoteName(), br.remoteBranch())) + "\n")
 		}
-		if !m.force && !br.gone && br.ahead > 0 {
-			b.WriteString("      " + errStyle.Render(fmt.Sprintf("⚠ %d unmerged commit(s) — safe delete (-d) will fail; use force (f)", br.ahead)) + "\n")
-		}
-		// A gone branch is force-deleted with -D and git reports no ahead count
-		// for it, so the generic unmerged warning above never fires. Without this
-		// line, deleting it would discard these commits with no warning at all.
-		if br.gone && br.riskCommits > 0 {
-			b.WriteString("      " + errStyle.Render(fmt.Sprintf("⚠ %d commit(s) not in %s — force delete (-D) will discard them", br.riskCommits, m.riskBase)) + "\n")
+		if w := m.riskWarning(br); w != "" {
+			b.WriteString("      " + errStyle.Render(w) + "\n")
 		}
 		b.WriteString("\n")
 	}
@@ -1210,6 +1292,30 @@ func (m model) confirmView() string {
 	return b.String()
 }
 
+// riskWarning states the cost of deleting br, or "" when the delete is clean.
+// It covers every branch git's safe delete would refuse plus gone branches,
+// which take the -D path regardless: under -D the unmerged commits are
+// discarded, under -d the delete simply fails.
+func (m model) riskWarning(br branch) string {
+	if br.safeDeletable() && !br.gone {
+		return ""
+	}
+	if br.forcedDelete(m.force) { // -D: the question is what gets discarded
+		if br.riskCommits > 0 {
+			return fmt.Sprintf("⚠ %d commit(s) not in %s — force delete (-D) will discard them", br.riskCommits, m.riskBase)
+		}
+		if m.riskBase == "" {
+			return "⚠ no base branch to compare against — force delete (-D) discards any unmerged commits"
+		}
+		return "" // measured against a real base: nothing here is at risk
+	}
+	// -d will be refused either way; the count is what a force would then cost.
+	if br.riskCommits > 0 {
+		return fmt.Sprintf("⚠ not fully merged: %d commit(s) not in %s — safe delete (-d) will fail; use force (f)", br.riskCommits, m.riskBase)
+	}
+	return "⚠ not fully merged — safe delete (-d) will fail; use force (f)"
+}
+
 func (m model) forcePromptView() string {
 	var b strings.Builder
 	failures := m.forceableFailures()
@@ -1222,9 +1328,20 @@ func (m model) forcePromptView() string {
 	b.WriteString(".\n\n")
 
 	for _, r := range failures {
-		b.WriteString("  " + cursorStyle.Render("• "+r.name) + "\n")
-		if r.ahead > 0 {
-			b.WriteString("      " + errStyle.Render(fmt.Sprintf("⚠ %d unmerged commit(s) will be lost", r.ahead)) + "\n")
+		b.WriteString("  " + cursorStyle.Render("• "+r.br.name) + "\n")
+		// Every branch here failed -d, so its risk was measured before the delete
+		// ran: riskCommits == 0 means either nothing is missing from the base or
+		// there was no base to measure against.
+		switch {
+		case r.br.riskCommits > 0:
+			b.WriteString("      " + errStyle.Render(fmt.Sprintf("⚠ %d commit(s) not in %s will be lost", r.br.riskCommits, m.riskBase)) + "\n")
+		case m.riskBase == "":
+			b.WriteString("      " + errStyle.Render("⚠ no base branch to compare against — unmerged commits may be lost") + "\n")
+		default:
+			b.WriteString("      " + dimStyle.Render("no commits missing from "+m.riskBase) + "\n")
+		}
+		if r.remoteSkipped {
+			b.WriteString("      " + errStyle.Render(fmt.Sprintf("+ remote %s/%s will be deleted once the branch is gone", r.br.remoteName(), r.br.remoteBranch())) + "\n")
 		}
 	}
 
@@ -1239,16 +1356,18 @@ func (m model) forcePromptView() string {
 // tried) into b. Shared by the results screen and the live deleting screen.
 func writeResultLines(b *strings.Builder, r deleteResult) {
 	if r.localOK {
-		b.WriteString(okStyle.Render("  ✓ ") + "deleted local " + r.name + "\n")
+		b.WriteString(okStyle.Render("  ✓ ") + "deleted local " + r.br.name + "\n")
 	} else {
-		b.WriteString(errStyle.Render("  ✗ ") + "local " + r.name + ": " + r.localErr + "\n")
+		b.WriteString(errStyle.Render("  ✗ ") + "local " + r.br.name + ": " + r.localErr + "\n")
 	}
-	if r.remoteTried {
-		if r.remoteOK {
-			b.WriteString(okStyle.Render("  ✓ ") + "deleted remote " + r.name + "\n")
-		} else {
-			b.WriteString(errStyle.Render("  ✗ ") + "remote " + r.name + ": " + r.remoteErr + "\n")
-		}
+	switch {
+	case r.remoteSkipped:
+		// Say why the armed remote survived, or it reads as a silent failure.
+		b.WriteString(errStyle.Render("  ! ") + "kept remote " + r.br.remoteName() + "/" + r.br.remoteBranch() + ": local delete failed\n")
+	case r.remoteTried && r.remoteOK:
+		b.WriteString(okStyle.Render("  ✓ ") + "deleted remote " + r.br.name + "\n")
+	case r.remoteTried:
+		b.WriteString(errStyle.Render("  ✗ ") + "remote " + r.br.name + ": " + r.remoteErr + "\n")
 	}
 }
 
@@ -1261,7 +1380,7 @@ func (m model) deletingView() string {
 		if r.done {
 			writeResultLines(&b, r)
 		} else {
-			b.WriteString(dimStyle.Render("  "+spin+" deleting "+r.name+"…") + "\n")
+			b.WriteString(dimStyle.Render("  "+spin+" deleting "+r.br.name+"…") + "\n")
 		}
 	}
 	b.WriteString("\n")
