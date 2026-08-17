@@ -111,6 +111,15 @@ delete `performDeletions`.
   (`visibleRows` is `height-5`; actual emission is `height+1`).
 - ANSI and control characters in commit subjects and branch names render raw into the terminal.
 - `applyBranches` silently discards the user's existing selections on `p`.
+- The cursor starts on an arbitrary row. `sortBranches` preserves the cursor by name
+  unconditionally, but at startup `cursor` is 0 and `branches` is still in `for-each-ref`
+  (alphabetical) order, so it pins the cursor to wherever the alphabetically-first branch
+  lands after sorting — row 10 of 11 on the demo repo. Skip the preserve when there is no
+  prior cursor to restore.
+- The confirmation screen warns `⚠ not merged into <default>` for every gone branch, because
+  `remoteMerged` tests the upstream ref and a gone branch no longer has one. Branches that were
+  merged and pushed before their upstream was deleted are flagged as if they held unique work;
+  `riskWarning` already reports the real cost correctly.
 - `stateDeleting`'s ctrl+c quits while `git push --delete` children are still running.
 
 ### Tier 3 — features for the tool's actual job

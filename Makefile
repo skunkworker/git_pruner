@@ -4,7 +4,7 @@ BINARY := git_pruner
 BINDIR ?= $(HOME)/shared/bin
 TARGET := $(BINDIR)/$(BINARY)
 
-.PHONY: build install test vet clean
+.PHONY: build install test vet clean assets
 
 build: $(TARGET)
 
@@ -22,3 +22,7 @@ vet:
 
 clean:
 	rm -f $(TARGET)
+
+# Re-records the README's demo GIF and screenshot; needs vhs on PATH.
+assets:
+	./assets/record.sh
