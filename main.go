@@ -133,6 +133,7 @@ type model struct {
 
 	remoteDefault string // resolved remote default branch, e.g. "origin/main"
 	riskBase      string // ref that branch.riskCommits is measured against ("" if unresolved)
+	riskBaseRef   string // riskBase fully qualified, so a same-named tag cannot shadow it
 
 	spinnerFrame int // animation frame for the deleting spinner (deletion counts derive from results)
 
@@ -192,11 +193,39 @@ func runGit(args ...string) (string, error) {
 	return out.String(), nil
 }
 
+// branchRef fully qualifies a local branch name. git's ref search order puts
+// refs/tags/<name> ahead of refs/heads/<name>, so a tag sharing a branch's name
+// silently shadows the branch in any command handed the bare name — and tagging a
+// release branch with its own name is ordinary practice.
+func branchRef(name string) string { return "refs/heads/" + name }
+
+// shortRef strips the namespace from a full ref, yielding the plain branch name
+// ("feature/x") or remote-tracking name ("origin/feature/x") the rest of the
+// program keys on. git's own %(refname:short) cannot be used for this: it yields
+// the shortest *unambiguous* name, which grows a "heads/" or "remotes/" prefix
+// exactly when a tag shares the name — silently breaking every name-keyed lookup
+// and every ref built back up from it.
+func shortRef(ref string) string {
+	for _, prefix := range []string{"refs/heads/", "refs/remotes/"} {
+		if s, ok := strings.CutPrefix(ref, prefix); ok {
+			return s
+		}
+	}
+	return ref
+}
+
+// refExists reports whether a ref resolves. Always pass a fully qualified ref: a
+// bare name would also match a tag (see branchRef).
+func refExists(ref string) bool {
+	_, err := runGit("rev-parse", "--verify", "--quiet", ref)
+	return err == nil
+}
+
 var trackRe = regexp.MustCompile(`ahead (\d+)|behind (\d+)`)
 
 func loadBranches() ([]branch, error) {
-	const format = "%(refname:short)%00%(objectname:short)%00%(committerdate:iso8601-strict)%00" +
-		"%(committerdate:relative)%00%(upstream:short)%00%(upstream:track)%00%(HEAD)%00%(contents:subject)"
+	const format = "%(refname)%00%(objectname:short)%00%(committerdate:iso8601-strict)%00" +
+		"%(committerdate:relative)%00%(upstream)%00%(upstream:track)%00%(HEAD)%00%(contents:subject)"
 	out, err := runGit("for-each-ref", "--format="+format, "refs/heads")
 	if err != nil {
 		return nil, err
@@ -211,10 +240,10 @@ func loadBranches() ([]branch, error) {
 			continue
 		}
 		b := branch{
-			name:         f[0],
+			name:         shortRef(f[0]),
 			hash:         f[1],
 			committedRel: f[3],
-			upstream:     f[4],
+			upstream:     shortRef(f[4]),
 			isCurrent:    f[6] == "*",
 			subject:      f[7],
 		}
@@ -256,43 +285,52 @@ func remotes() []string {
 	return names
 }
 
-// localDefaultBranch returns a local main/master, skipping exclude so a branch
-// is never compared against itself. Returns "" when neither exists.
+// localDefaultBranch returns the ref of a local main/master, skipping exclude (a
+// short branch name) so a branch is never compared against itself. Returns ""
+// when neither exists.
+//
+// The resolvers below all return fully qualified refs, and the display layer
+// shortens them with shortRef. Resolving is the only place the namespace is
+// known for certain, so carrying it forward from here is what keeps a same-named
+// tag from being measured in place of the branch further down.
 func localDefaultBranch(exclude string) string {
 	for _, c := range []string{"main", "master"} {
 		if c == exclude {
 			continue
 		}
-		if _, err := runGit("rev-parse", "--verify", "--quiet", c); err == nil {
-			return c
+		if ref := branchRef(c); refExists(ref) {
+			return ref
 		}
 	}
 	return ""
 }
 
 // remoteDefault resolves the remote's default branch as a remote-tracking ref
-// (e.g. "origin/main"): <remote>/HEAD if set, else <remote>/main, else
-// <remote>/master, trying each remote in turn. Returns "" when none can be found.
+// (e.g. "refs/remotes/origin/main"): <remote>/HEAD if set, else <remote>/main,
+// else <remote>/master, trying each remote in turn. Returns "" when none can be
+// found.
 func remoteDefault() string {
 	for _, r := range remotes() {
-		if out, err := runGit("symbolic-ref", "--short", "refs/remotes/"+r+"/HEAD"); err == nil {
+		// Deliberately not symbolic-ref --short: it shortens to the shortest
+		// *unambiguous* name, which a same-named tag turns into "remotes/origin/main".
+		if out, err := runGit("symbolic-ref", "refs/remotes/"+r+"/HEAD"); err == nil {
 			if s := strings.TrimSpace(out); s != "" {
 				return s
 			}
 		}
 		for _, c := range []string{r + "/main", r + "/master"} {
-			if _, err := runGit("rev-parse", "--verify", "--quiet", "refs/remotes/"+c); err == nil {
-				return c
+			if ref := "refs/remotes/" + c; refExists(ref) {
+				return ref
 			}
 		}
 	}
 	return ""
 }
 
-// baseBranch returns a reference to diff a branch against: the remote default
-// branch, else a local main/master, excluding name itself.
+// baseBranch returns the ref to diff a branch against: the remote default branch,
+// else a local main/master, excluding name itself.
 func baseBranch(name string) string {
-	if def := remoteDefault(); def != "" && def != name {
+	if def := remoteDefault(); def != "" {
 		return def
 	}
 	return localDefaultBranch(name)
@@ -306,10 +344,11 @@ func baseBranch(name string) string {
 // the warning is therefore worded as "not in <base>", not "will be lost".
 // Returns 0 when there is nothing to compare against.
 func riskCommitCount(name, base string) int {
-	if base == "" || base == name {
+	ref := branchRef(name)
+	if base == "" || base == ref {
 		return 0
 	}
-	out, err := runGit("cherry", base, name)
+	out, err := runGit("cherry", base, ref)
 	if err != nil {
 		return 0
 	}
@@ -326,21 +365,21 @@ func riskCommitCount(name, base string) int {
 // it reports into a set.
 func mergedSet(args ...string) map[string]bool {
 	set := map[string]bool{}
-	out, err := runGit(append(args, "--format=%(refname:short)")...)
+	out, err := runGit(append(args, "--format=%(refname)")...)
 	if err != nil {
 		return set
 	}
 	for _, line := range strings.Split(out, "\n") {
 		if s := strings.TrimSpace(line); s != "" {
-			set[s] = true
+			set[shortRef(s)] = true
 		}
 	}
 	return set
 }
 
 // remoteMergedSet returns the set of remote-tracking branches (short names, e.g.
-// "origin/feature") whose tip is merged into def. Operates on local
-// remote-tracking refs, so it needs no network — it reflects the last fetch.
+// "origin/feature") whose tip is merged into def, a qualified ref. Operates on
+// local remote-tracking refs, so it needs no network — it reflects the last fetch.
 func remoteMergedSet(def string) map[string]bool {
 	if def == "" {
 		return map[string]bool{}
@@ -394,14 +433,15 @@ func spinnerTickCmd() tea.Cmd {
 }
 
 // loadDiff returns the patch introduced on name relative to its merge-base with
-// the repo's default branch — i.e. what the branch contains — and the base ref used.
+// the repo's default branch — i.e. what the branch contains — and the base it was
+// compared against, shortened for display.
 func loadDiff(name string) (diff, base string, err error) {
-	base = baseBranch(name)
-	if base == "" {
-		base = "HEAD"
+	ref := baseBranch(name)
+	if ref == "" {
+		ref = "HEAD"
 	}
-	diff, err = runGit("diff", base+"..."+name)
-	return diff, base, err
+	diff, err = runGit("diff", ref+"..."+branchRef(name))
+	return diff, shortRef(ref), err
 }
 
 // ---- model ----
@@ -518,7 +558,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if branches, err := loadBranches(); err == nil {
-			m.applyBranches(branches) // preserves the cursor by name (fetch is non-destructive)
+			// A fetch is non-destructive, so both the cursor (by name, in
+			// sortBranches) and the user's pending marks survive it.
+			m.applyBranches(carryMarks(m.branches, branches))
 		}
 		// Auto-select only gone branches that carry nothing missing from the
 		// base. Ones holding unique commits are left unselected so discarding
@@ -847,7 +889,9 @@ func deleteBranch(b branch, flag string, wantRemote bool) deleteResult {
 func pushRemoteDelete(res *deleteResult) {
 	res.remoteSkipped = false
 	res.remoteTried = true
-	if _, err := runGit("push", res.br.remoteName(), "--delete", res.br.remoteBranch()); err != nil {
+	// Qualify the remote branch: a remote carrying both a branch and a tag of that
+	// name rejects a bare refspec as matching more than one ref, deleting nothing.
+	if _, err := runGit("push", res.br.remoteName(), "--delete", branchRef(res.br.remoteBranch())); err != nil {
 		res.remoteErr = err.Error()
 	} else {
 		res.remoteOK = true
@@ -865,6 +909,25 @@ func (m *model) performDeletions() {
 		m.results = append(m.results, deleteBranch(b, b.deleteFlag(m.force), wantRemote))
 	}
 	m.reloadBranches()
+}
+
+// carryMarks copies the user's pending selections from old onto a freshly loaded
+// branch set, matching by name. Used on the fetch path, which reloads every
+// branch struct but changes nothing the marks were made about. An armed remote
+// delete is dropped when the fetch reveals the upstream is already gone: the push
+// it would run can only fail.
+func carryMarks(old, fresh []branch) []branch {
+	prev := make(map[string]branch, len(old))
+	for _, b := range old {
+		prev[b.name] = b
+	}
+	for i := range fresh {
+		if p, ok := prev[fresh[i].name]; ok {
+			fresh[i].selected = p.selected
+			fresh[i].deleteRemote = p.deleteRemote && !fresh[i].gone
+		}
+	}
+	return fresh
 }
 
 // applyBranches installs a freshly-loaded branch set and recomputes everything
@@ -892,14 +955,17 @@ func (m *model) reloadBranches() {
 // upstream is merged into it or whose tip is merged into HEAD, and measures what
 // deleting it would cost. Call after every branch (re)load.
 func (m *model) refreshMergeInfo() {
-	m.remoteDefault = remoteDefault()
-	merged := remoteMergedSet(m.remoteDefault)
+	defRef := remoteDefault()
+	merged := remoteMergedSet(defRef)
 	headMerged := localMergedSet()
 
-	m.riskBase = m.remoteDefault
-	if m.riskBase == "" {
-		m.riskBase = localDefaultBranch("")
+	m.riskBaseRef = defRef
+	if m.riskBaseRef == "" {
+		m.riskBaseRef = localDefaultBranch("")
 	}
+	// The refs drive git; the short forms are what the views print.
+	m.remoteDefault = shortRef(defRef)
+	m.riskBase = shortRef(m.riskBaseRef)
 
 	for i := range m.branches {
 		b := &m.branches[i]
@@ -921,7 +987,7 @@ func (m *model) measureRisk(b *branch) {
 	if b.riskMeasured {
 		return
 	}
-	b.riskCommits = riskCommitCount(b.name, m.riskBase)
+	b.riskCommits = riskCommitCount(b.name, m.riskBaseRef)
 	b.riskMeasured = true
 }
 
