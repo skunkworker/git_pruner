@@ -78,6 +78,124 @@ to fail against the old code (`date column at cell 31, want 33`) before being ke
 silently vanished — no error, the safety signal simply was not there. `remotes()` now tries every
 configured remote with `origin` ordered first.
 
+### Tier 2
+
+**7. The tested delete path was not the one users run.** `performDeletions` was test-only by its
+own comment, so the live async path's completion logic — `branchDeletedMsg` → `deletesDone` → the
+`stateForcePrompt` / `stateResult` transition — was never fed through `Update`. The riskiest state
+machine in the program was the untested one.
+
+All 18 delete call sites now drive the real path through a `drainDeletions` helper, which runs the
+`tea.Batch` cmds concurrently (as the runtime does) and feeds every `branchDeletedMsg` back through
+`Update`. The force prompt is answered with a keystroke rather than by calling
+`forceDeleteUnmerged` directly, and the four tests that hand-set `state = stateForcePrompt` now
+assert the machine put them there. `performDeletions` has been deleted.
+
+Five tests cover what only the async path can get wrong; each was verified to fail against a
+deliberately broken `Update` before being kept:
+
+| test | mutation it catches |
+| ---- | ------------------- |
+| `TestDeletingWaitsForEveryResult` | completing the run on the first result (`> 0` instead of `>= len(m.results)`) — and reloading the branch list mid-run, which would renumber the indices outstanding messages still write to |
+| `TestStrayDeleteResultIsIgnored`  | dropping the `msg.idx` bounds check — panics with `index out of range [7]` |
+| `TestSpinnerTickStopsAfterDeleting` | dropping the `state == stateDeleting` guard, leaving the tick re-arming forever |
+| `TestForcePromptDeclineKeepsBranch` | `n` at the prompt discarding the branch it exists to spare |
+| `TestDeletingIgnoresKeysExceptCtrlC` | a stray keystroke dismissing a run whose results have not landed |
+
+**14. Startup and refresh spent over a second measuring risk, one branch at a time.** Every
+`git cherry` is its own subprocess, and `refreshMergeInfo` ran one per gone branch in sequence —
+on the tool's headline case, a repo full of gone branches, that is the whole list on the clock
+before the first paint, again after every fetch, and again after every prune.
+
+Measured on a 101-branch repo where 100 branches are gone:
+
+| path | before | after |
+| ---- | ------ | ----- |
+| `initialModel` (startup)            | 1.14s | 0.56s |
+| `refreshMergeInfo` (fetch / reload) | 1.12s | 0.33s |
+| `measureSelectedRisk` (pressing `d`)| 1.09s | 0.25s |
+
+The cost is process spawn, not git work: 100 × `git rev-parse HEAD` takes 0.63s against 100 ×
+`git cherry` at 0.74s, so ~6ms per subprocess is the floor and no cheaper git command would have
+helped. `measureRisk` now takes a predicate and runs the calls concurrently, one goroutine per
+branch writing its own slice element. A cap sweep on the same repo put the knee at 4–8 workers
+(1 → 1056ms, 4 → 364ms, 8 → 330ms, 32 → 331ms), so `maxLocalGit` is 8; past that the limit is
+elsewhere.
+
+**15. A wide prune opened one connection per branch.** `tea.Batch` gives every selected branch its
+own goroutine (`bubbletea/tea.go:545`), so arming remotes on 100 branches meant 100 simultaneous
+`git push --delete` — 100 connections a remote would throttle or refuse. A failed push there is
+the worst shape the tool has: the local branch is already gone, and the copy that was meant to
+outlive it is still sitting on the remote.
+
+Local and network work are now capped separately — `maxLocalGit = 8`, `maxRemotePush = 3` — so a
+wide local fan-out never widens the network one. The cap sits inside `runGit`, the single door
+every git invocation already passes through, and `networkBound(args)` picks which one applies. Put
+at the call sites instead it held only for the callers that remembered to ask: `fetchPruneCmd` and
+`forceDeleteUnmerged` both escaped it.
+
+The cap is measured on the subprocesses themselves, not on the limiter: `runGit` feeds two
+`gauge`s, one for all git processes and one for the network-bound ones. Instrumenting the limiter
+would have stopped reporting along with it — verified by deleting the limiter, which took the
+observed peak from 3 to 17 and failed `TestWideDeleteStaysWithinCaps`. The test asserts literal
+bounds rather than the constants, so raising a cap breaks it instead of moving with it.
+
+The earlier "60 parallel deletes succeeded" note below still stands, but it only ever covered
+local ref locking. It says nothing about the network.
+
+**16. A `git cherry` subprocess per branch, for an answer one query already held.** `measureRisk`
+ran `git cherry <base> <branch>` for every gone branch. A branch whose tip is already an ancestor
+of the base has an empty `base..branch` range, so `git cherry` can only report nothing — and on
+the tool's headline case, a repo full of branches that were merged and then pruned, that is nearly
+every one of them.
+
+`refreshMergeInfo` now runs one `git branch --merged <base>` and caches the result in
+`m.baseMerged`; `measureRisk` reads the set instead of starting a process. Measured on the same
+101-branch fixture (100 gone, all merged): startup **529ms → 45ms**, peak concurrent git
+processes 8 → 2. One query at 9ms replaced 30 `git cherry` calls at 330ms on a 30-branch probe.
+
+`TestMergedBranchesCostNoSubprocess` asserts a literal process bound rather than a time, and fails
+at 39 processes when the shortcut is removed.
+
+**17. The confirm screen rendered its whole body, pushing its own question off the terminal.**
+`confirmView` wrote every selected branch in full. With 40 selected that is 206 rows into a 24-row
+terminal, with `Delete these branches?` on row 205 — the user answered a prompt they could not
+read. `forcePromptView`, `resultView` and `deletingView` had the same shape.
+
+All four now go through `page(header, body, footer)`, which renders the header, a window into the
+body, and the footer, plus a position line when the body does not fit. `scrollKeys` adds ↑/↓,
+space, ctrl+d/u, pgup/pgdn and g/G, and the mouse wheel scrolls them; each screen answers its own
+keys first, so `y`, `R` and `n` are never swallowed. Rendering only the visible rows also takes
+the per-frame cost off the length of the list.
+
+**18. Startup was six git subprocesses deep, and the depth was the whole cost.** On this repo
+(3 branches) startup was 34ms, all of it process-start latency — one `git` costs ~6.5ms to spawn,
+and the chain ran `rev-parse` → `for-each-ref` → `remote` → `symbolic-ref` → `branch -r --merged`
+→ `branch --merged <base>` in sequence. Only `branch --merged HEAD` overlapped anything.
+
+Three changes, together taking the chain to two rounds:
+
+- `loadRemoteRefs` reads `refs/remotes` once with `--format='%(refname)%00%(symref)'`. That single
+  call replaces `git remote`, a `symbolic-ref` per remote and a `rev-parse --verify` per candidate.
+  `%(symref)` yields the full ref, so it keeps the tag-shadowing guarantee `symbolic-ref --short`
+  would break. Remote names now come out of the refs: a remote with no fetched refs holds nothing
+  a default branch could resolve to, so nothing is lost.
+- `localDefaultBranch` takes a `has(name)` predicate. `refreshMergeInfo` passes a lookup into the
+  branch list it already holds; only `baseBranch`, which has no list, still pays `gitHasBranch`.
+- `loadRepo` starts `loadBranches`, `localMergedSet` and `loadRemoteRefs` in one round, and
+  `initialModel` runs the repo check beside them rather than ahead of them. `refreshMergeInfo`
+  then runs `branch -r --merged` and `branch --merged <base>` as a second round.
+
+| repo | before | after |
+| ---- | ------ | ----- |
+| this one (3 branches)                | 34ms | 19ms |
+| 101 branches, 100 gone (with item 16)| 529ms | 17ms |
+| 501 branches                         | 90ms | 77ms |
+
+The 501-branch case is `for-each-ref`'s own work (42ms of the 77ms), not chain depth — measured at
+15ms for `%(refname)` alone against 42ms for the full format, so the commit-object reads behind
+`%(committerdate)` are the floor there.
+
 ### Also completed
 
 - `LICENSE` (MIT)
@@ -90,27 +208,33 @@ configured remote with `origin` ordered first.
 
 ### Tier 2 — robustness
 
-**5. Blocking git calls inside `Update`.** `loadDiff` (`v`), `refreshMergeInfo`, and
-`reloadBranches` run synchronously in the update loop. `git branch -r --merged` is
-O(remote refs × history) and runs on *every* reload; on a repo with thousands of remote branches
-the UI freezes. The `tea.Cmd` pattern already works for fetch — reuse it. Note that
-`refreshMergeInfo` now also issues one `git cherry` per gone branch, which raises the stakes.
+**5. Blocking git calls inside `Update`.** `loadDiff` (`v`), `refreshMergeInfo` and
+`reloadBranches` still run synchronously in the update loop, so what remains of their cost is
+still a freeze. Items 14, 16 and 18 under Completed took the residue to ~16ms on a
+100-gone-branch repo, so this is no longer a visible freeze — what it would still buy is the
+first paint, which currently waits on the whole two-round load. Moving `refreshMergeInfo` onto
+the `tea.Cmd` pattern already used for fetch would put the branch list on screen after one
+subprocess (~7ms) and fill the ✓ and risk columns in behind it.
+
+Do not reach for `git branch -r --merged` first: it was measured at 100ms with 2000 remote
+refs, roughly a tenth of what the `git cherry` loop beside it cost.
 
 **6. `runGit` has no timeout and does not disable terminal prompts.** `fetch --all --prune` and
 `push --delete` are network-bound; a credential or SSH prompt hangs the TUI with no recovery.
 Set `GIT_TERMINAL_PROMPT=0` and attach a `context.WithTimeout` so it fails fast instead.
 
-**7. The tested delete path is not the one users run.** `performDeletions` is test-only by its own
-comment; the live async path's completion logic — `branchDeletedMsg` → `deletesDone` → the
-`stateForcePrompt` / `stateResult` transition — is never fed through `Update` in any test. The
-riskiest state machine in the program is the untested one. Port the tests to the async path and
-delete `performDeletions`.
-
 **8. Smaller items.**
+- Rows are wider than the terminal whenever `subjectWidth` hits its `max(10, …)` floor, and each
+  wrapped row eats two screen lines while `visibleRows` still counts it as one — so the list
+  overruns and the footer scrolls away. Measured threshold: rows wrap below `68 + nameW` columns,
+  which at a classic 80-column terminal means any branch name of 13 cells or more wraps *every*
+  row. `renderRow` needs to fit `m.width` rather than assume it.
 - `listView` runs one line over terminal height when `status` and `err` are both set
-  (`visibleRows` is `height-5`; actual emission is `height+1`).
+  (`visibleRows` is `height-5`; actual emission is `height+1`) — confirmed at 25 lines for a
+  height of 24.
 - ANSI and control characters in commit subjects and branch names render raw into the terminal.
-- `applyBranches` silently discards the user's existing selections on `p`.
+  Confirmed: a `\x1b[31m` in a subject reaches the row intact (a bare `BEL` is stripped by
+  `ansi.Truncate`). The text comes from fetched branches, so it is not the author's to trust.
 - The cursor starts on an arbitrary row. `sortBranches` preserves the cursor by name
   unconditionally, but at startup `cursor` is 0 and `branches` is still in `for-each-ref`
   (alphabetical) order, so it pins the cursor to wherever the alphabetically-first branch
@@ -143,6 +267,15 @@ naturally with finding 1.
 ---
 
 ## Investigated and rejected
+
+**A commit subject spanning several lines breaking the `for-each-ref` parse.** `loadBranches`
+splits output on newlines and needs 8 NUL-separated fields per branch, so an embedded newline
+would silently drop branches from the list. It cannot happen: `%(contents:subject)` folds the
+subject's newlines to spaces. Verified against a commit whose subject wraps before the blank line.
+
+**A duplicate or stray `branchDeletedMsg` ending a run early.** `deletesDone` counts `done` flags
+on the results, not messages received, so a repeat cannot over-count; an out-of-range index is
+dropped by the bounds check. Both are covered by `TestStrayDeleteResultIsIgnored`.
 
 **Concurrent `git branch -d` racing on `packed-refs.lock`.** `tea.Batch` runs deletions
 concurrently, which looked like it should collide on the packed-refs lock. Tested with 60 parallel

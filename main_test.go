@@ -4,9 +4,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -16,17 +20,80 @@ import (
 // key builds a rune KeyMsg (e.g. "y", "R") for driving update handlers in tests.
 func key(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
 
-// runCmd executes a tea.Cmd to completion, recursing into batched cmds, so tests
-// can drive the async deletion path synchronously.
-func runCmd(t *testing.T, cmd tea.Cmd) {
+// deleteMsgs runs every cmd in a deletion batch concurrently — as the tea
+// runtime does — and returns the branchDeletedMsgs they produce. The batch is
+// one cmd per branch plus the spinner tick, which is dropped: it only animates,
+// and waiting on its 120ms timer would slow every caller.
+func deleteMsgs(t *testing.T, cmd tea.Cmd) []branchDeletedMsg {
 	t.Helper()
 	if cmd == nil {
-		return
+		t.Fatal("want a deletion batch cmd, got nil")
 	}
-	if batch, ok := cmd().(tea.BatchMsg); ok {
-		for _, c := range batch {
-			runCmd(t, c)
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("want a tea.BatchMsg, got %T", msg)
+	}
+	msgs := make(chan tea.Msg, len(batch))
+	for _, c := range batch {
+		go func() { msgs <- c() }()
+	}
+	want := len(batch) - 1
+	timeout := time.NewTimer(30 * time.Second)
+	defer timeout.Stop()
+	var out []branchDeletedMsg
+	for len(out) < want {
+		select {
+		case msg := <-msgs:
+			if dm, ok := msg.(branchDeletedMsg); ok {
+				out = append(out, dm)
+			}
+		case <-timeout.C:
+			t.Fatalf("timed out after %d of %d deletions reported", len(out), want)
 		}
+	}
+	return out
+}
+
+// drainDeletions runs a deletion batch and feeds each result back through
+// Update, so tests exercise the path users actually run: the completion logic
+// (reload, then force-prompt vs result) decides the end state rather than the
+// test asserting it into place.
+func drainDeletions(t *testing.T, m model, cmd tea.Cmd) model {
+	t.Helper()
+	for _, dm := range deleteMsgs(t, cmd) {
+		nm, _ := m.Update(dm)
+		m = nm.(model)
+	}
+	return m
+}
+
+// startAndDrain deletes m's selected branches and drives the run to completion.
+// Starting the batch inside the call keeps m's copy and startDeletions' writes
+// to it from being operands of one expression, where Go does not define which
+// happens first.
+func startAndDrain(t *testing.T, m model, includeRemote bool) model {
+	t.Helper()
+	return drainDeletions(t, m, m.startDeletions(includeRemote))
+}
+
+// selectAll marks every branch but the current one, arming the remote delete too
+// when arm is set.
+func selectAll(m *model, arm bool) {
+	for i := range m.branches {
+		if m.branches[i].isCurrent {
+			continue
+		}
+		m.branches[i].selected = true
+		m.branches[i].deleteRemote = arm
+	}
+}
+
+// wantState asserts the state the machine landed in, with why it had to.
+func wantState(t *testing.T, m model, want viewState, why string) {
+	t.Helper()
+	if m.state != want {
+		t.Fatalf("%s: state is %v, want %v", why, m.state, want)
 	}
 }
 
@@ -92,6 +159,23 @@ func setupRepo(t *testing.T) string {
 	git(t, tmp, "checkout", "-q", "-b", "feature/tracked", "feature/unmerged")
 	git(t, tmp, "push", "-q", "-u", "origin", "feature/tracked")
 	git(t, tmp, "checkout", "-q", "main")
+	return tmp
+}
+
+// setupManyTracked builds a repo whose n feature branches each track origin and
+// hold a commit of their own, so a prune of the lot fans out widely.
+func setupManyTracked(t *testing.T, n int) string {
+	t.Helper()
+	tmp := initRepo(t, "main")
+	commitFile(t, tmp, "a", "a")
+	addOrigin(t, tmp, "main")
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("feature/%d", i)
+		git(t, tmp, "checkout", "-q", "-b", name, "main")
+		commitFile(t, tmp, fmt.Sprintf("f%d", i), name)
+	}
+	git(t, tmp, "checkout", "-q", "main")
+	git(t, tmp, "push", "-q", "-u", "origin", "--all") // one connection, not n
 	return tmp
 }
 
@@ -204,7 +288,7 @@ func TestPruneGoneBranch(t *testing.T) {
 	}
 	find(m.branches, "feature/tracked").selected = true
 	m.force = false
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 
 	if len(m.results) != 1 || !m.results[0].localOK {
 		t.Fatalf("gone branch should force-delete: %+v", m.results)
@@ -239,7 +323,7 @@ func TestSafeDeleteRefusesUnmerged(t *testing.T) {
 	find(m.branches, "feature/merged").selected = true
 	find(m.branches, "feature/unmerged").selected = true
 	m.force = false // safe -d
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 
 	var merged, unmerged *deleteResult
 	for i := range m.results {
@@ -275,10 +359,11 @@ func TestForceDeleteUnmergedRetry(t *testing.T) {
 	}
 	find(m.branches, "feature/unmerged").selected = true
 	m.force = false // safe -d, which will be refused
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 
 	// The refused unmerged branch should be surfaced for a force prompt, with
 	// its ahead count copied onto the result (0 here: it has no upstream).
+	wantState(t, m, stateForcePrompt, "a refused -d must raise the force prompt")
 	failures := m.forceableFailures()
 	if len(failures) != 1 || failures[0].br.name != "feature/unmerged" {
 		t.Fatalf("want feature/unmerged in forceableFailures, got %+v", failures)
@@ -290,8 +375,10 @@ func TestForceDeleteUnmergedRetry(t *testing.T) {
 		t.Fatal("feature/unmerged should still exist before force retry")
 	}
 
-	// Answering yes retries with -D and clears the branch.
-	m.forceDeleteUnmerged()
+	// Answering yes at the prompt retries with -D and clears the branch.
+	nm, _ := m.Update(key("y"))
+	m = nm.(model)
+	wantState(t, m, stateResult, "answering the prompt must land on the results screen")
 	if len(m.forceableFailures()) != 0 {
 		t.Fatalf("no failures should remain after force retry: %+v", m.results)
 	}
@@ -317,7 +404,7 @@ func TestNoForcePromptForCleanDelete(t *testing.T) {
 	}
 	find(m.branches, "feature/merged").selected = true
 	m.force = false
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 
 	if len(m.results) != 1 || !m.results[0].localOK {
 		t.Fatalf("merged branch should delete cleanly: %+v", m.results)
@@ -349,7 +436,7 @@ func TestGoneFailureNotForceable(t *testing.T) {
 	}
 	tb.selected = true
 	m.force = false // gone branches still use -D
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 
 	if len(m.results) != 1 || !m.results[0].localOK {
 		t.Fatalf("gone branch should force-delete: %+v", m.results)
@@ -371,8 +458,9 @@ func TestForceDeleteUnmergedNoop(t *testing.T) {
 	}
 	find(m.branches, "feature/merged").selected = true
 	m.force = false
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 	before := len(m.branches)
+	wantState(t, m, stateResult, "a clean delete must skip the force prompt")
 
 	m.forceDeleteUnmerged() // no forceable failures — should change nothing
 	if len(m.forceableFailures()) != 0 {
@@ -398,7 +486,7 @@ func TestForceDeleteAndRemote(t *testing.T) {
 	tb.selected = true
 	tb.deleteRemote = true
 	m.force = true // -D, also needed since tracked has its own commit
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 
 	if len(m.results) != 1 {
 		t.Fatalf("want 1 result, got %d", len(m.results))
@@ -447,6 +535,254 @@ func TestDeleteBranchCmd(t *testing.T) {
 	}
 }
 
+// runGit is where the cap lives, so callers cannot escape it however many pile
+// in at once — and it still runs them in parallel rather than one at a time.
+func TestGitCallsAreCapped(t *testing.T) {
+	chdir(t, setupLocalRepo(t))
+
+	const callers = 40
+	gitProcs.peak.Store(0)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runGit("rev-parse", "--git-dir")
+		}()
+	}
+	wg.Wait()
+
+	peak := gitProcs.peak.Load()
+	if peak > maxLocalGit {
+		t.Fatalf("%d callers ran %d git processes at once, cap is %d", callers, peak, maxLocalGit)
+	}
+	if peak < 2 {
+		t.Fatalf("the cap serialized everything: peak %d", peak)
+	}
+	if n := gitProcs.inFlight.Load(); n != 0 {
+		t.Fatalf("every slot should be released, %d still held", n)
+	}
+}
+
+// Pruning a wide selection must not open a connection per branch: remotes
+// throttle or refuse a burst, and a failed push is a branch deleted locally
+// whose only other copy is still out there.
+func TestWideDeleteStaysWithinCaps(t *testing.T) {
+	const n = 20
+	repo := setupManyTracked(t, n)
+	chdir(t, repo)
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectAll(&m, true)
+	m.force = true
+
+	gitProcs.peak.Store(0)
+	netProcs.peak.Store(0)
+	m = startAndDrain(t, m, true)
+
+	// Literal bounds, not the constants under test: raising a cap must break this
+	// test rather than move the goalposts with it.
+	const fewConnections, fewProcesses = 4, 12
+	if maxRemotePush > fewConnections {
+		t.Fatalf("maxRemotePush is %d; a prune should never ask a remote for more than %d connections", maxRemotePush, fewConnections)
+	}
+	if got := netProcs.peak.Load(); got > fewConnections {
+		t.Fatalf("%d branches opened %d simultaneous connections to the remote", n, got)
+	}
+	if got := gitProcs.peak.Load(); got > fewProcesses {
+		t.Fatalf("%d branches ran %d git processes at once", n, got)
+	}
+	if netProcs.peak.Load() == 0 {
+		t.Fatal("no pushes were observed; the test is not measuring the remote path")
+	}
+	// The cap must not cost any of them their deletion.
+	for _, r := range m.results {
+		if !r.localOK || !r.remoteOK {
+			t.Fatalf("throttled delete did not complete: %+v", r)
+		}
+	}
+	if len(m.branches) != 1 {
+		t.Fatalf("only the current branch should remain, got %v", branchNames(m.branches))
+	}
+}
+
+// Risk is measured concurrently, one goroutine per branch writing its own slice
+// element. Each branch must end up with its own count, not a neighbour's.
+func TestConcurrentRiskMeasurementKeepsCountsWithBranch(t *testing.T) {
+	repo := initRepo(t, "main")
+	chdir(t, repo)
+	commitFile(t, repo, "a", "a")
+
+	// feature/i carries i commits of its own. Branching off one chain costs n
+	// commits for the n distinct counts; a fresh branch each time costs n(n+1)/2.
+	const n = 12
+	git(t, repo, "checkout", "-q", "-b", "chain", "main")
+	for i := 1; i <= n; i++ {
+		commitFile(t, repo, fmt.Sprintf("f%d", i), "x")
+		git(t, repo, "branch", fmt.Sprintf("feature/%d", i))
+	}
+	git(t, repo, "checkout", "-q", "main")
+	git(t, repo, "branch", "-D", "chain")
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectAll(&m, false)
+	m.measureSelectedRisk()
+
+	for i := 1; i <= n; i++ {
+		name := fmt.Sprintf("feature/%d", i)
+		b := find(m.branches, name)
+		if b == nil || !b.riskMeasured {
+			t.Fatalf("%s was not measured: %+v", name, b)
+		}
+		if b.riskCommits != i {
+			t.Fatalf("%s should hold %d commits, measured %d", name, i, b.riskCommits)
+		}
+	}
+}
+
+// The live path only leaves stateDeleting once every branch has reported, and
+// the branch list is not reloaded before then — a mid-run reload would renumber
+// the results the outstanding messages are still indexing into.
+func TestDeletingWaitsForEveryResult(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	find(m.branches, "feature/merged").selected = true   // -d succeeds
+	find(m.branches, "feature/unmerged").selected = true // -d is refused
+	m.force = false
+
+	msgs := deleteMsgs(t, m.startDeletions(false))
+	if len(msgs) != 2 {
+		t.Fatalf("want 2 results, got %d", len(msgs))
+	}
+	for i, dm := range msgs {
+		nm, _ := m.Update(dm)
+		m = nm.(model)
+		if !m.results[dm.idx].done {
+			t.Fatalf("result %d should be marked done: %+v", dm.idx, m.results[dm.idx])
+		}
+		if i == len(msgs)-1 {
+			break
+		}
+		wantState(t, m, stateDeleting, "state must hold at stateDeleting until the last result")
+		if find(m.branches, "feature/merged") == nil {
+			t.Fatal("the branch list must not be reloaded mid-run")
+		}
+	}
+	wantState(t, m, stateForcePrompt, "the refused -d should raise the force prompt")
+	if find(m.branches, "feature/merged") != nil {
+		t.Fatal("the final result should have reloaded the branch list")
+	}
+}
+
+// A result carrying an index outside the current run must be dropped rather
+// than panic: the async cmds outlive nothing here, but the bounds check is the
+// only thing standing between a stale message and an out-of-range write.
+func TestStrayDeleteResultIsIgnored(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	find(m.branches, "feature/merged").selected = true
+	m.startDeletions(false)
+
+	nm, _ := m.Update(branchDeletedMsg{idx: 7, res: deleteResult{done: true}})
+	m = nm.(model)
+	wantState(t, m, stateDeleting, "a stray result must not complete the run")
+	if m.deletesDone() != 0 {
+		t.Fatalf("a stray result must not be counted, got %d", m.deletesDone())
+	}
+}
+
+// Declining the force prompt leaves the refused branch — and its commits — in
+// place. This is the escape hatch the -d/-D split exists for.
+func TestForcePromptDeclineKeepsBranch(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	find(m.branches, "feature/unmerged").selected = true
+	m.force = false
+	m = startAndDrain(t, m, true)
+	wantState(t, m, stateForcePrompt, "a refused -d must raise the force prompt")
+
+	nm, _ := m.Update(key("n"))
+	m = nm.(model)
+	wantState(t, m, stateResult, "declining must land on the results screen")
+	if find(m.branches, "feature/unmerged") == nil {
+		t.Fatal("declining the force prompt must keep the branch")
+	}
+	if len(m.forceableFailures()) != 1 {
+		t.Fatalf("the refusal must still be reported: %+v", m.results)
+	}
+}
+
+// While deletions are in flight the keyboard is inert except for ctrl+c, so a
+// stray keystroke cannot dismiss a run whose results have not landed yet.
+func TestDeletingIgnoresKeysExceptCtrlC(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.state = stateDeleting
+
+	for _, k := range []tea.KeyMsg{key("q"), key("y"), key("d")} {
+		nm, cmd := m.Update(k)
+		if got := nm.(model).state; got != stateDeleting {
+			t.Fatalf("%v must not change state, got %v", k, got)
+		}
+		if cmd != nil {
+			t.Fatalf("%v must not issue a cmd", k)
+		}
+	}
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd == nil {
+		t.Fatal("ctrl+c must abort")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatalf("ctrl+c should quit, got %T", cmd())
+	}
+}
+
+// The spinner re-arms itself only while deletions are running; once the run has
+// landed the tick must die out rather than loop forever.
+func TestSpinnerTickStopsAfterDeleting(t *testing.T) {
+	m := model{state: stateDeleting}
+
+	nm, cmd := m.Update(spinnerTickMsg{})
+	if nm.(model).spinnerFrame != 1 {
+		t.Fatalf("frame should advance, got %d", nm.(model).spinnerFrame)
+	}
+	if cmd == nil {
+		t.Fatal("the tick must re-arm while deleting")
+	}
+
+	m.state = stateResult
+	if _, cmd := m.Update(spinnerTickMsg{}); cmd != nil {
+		t.Fatal("the tick must not re-arm once the run has landed")
+	}
+}
+
 // #4: on the confirm screen, 'y' deletes locals only while 'R' also deletes the
 // armed remote.
 func TestConfirmRemoteConfirmationSplit(t *testing.T) {
@@ -465,13 +801,9 @@ func TestConfirmRemoteConfirmationSplit(t *testing.T) {
 		m.state = stateConfirm
 
 		nm, cmd := m.updateConfirm(key("y"))
-		if nm.(model).state != stateDeleting {
-			t.Fatalf("state should be stateDeleting, got %v", nm.(model).state)
-		}
-		if cmd == nil {
-			t.Fatal("expected a deletion batch cmd")
-		}
-		runCmd(t, cmd)
+		wantState(t, nm.(model), stateDeleting, "state should be stateDeleting")
+		m = drainDeletions(t, nm.(model), cmd)
+		wantState(t, m, stateResult, "a clean -D run should land on the results screen")
 		if !remoteHasBranch(t, repo, "feature/tracked") {
 			t.Fatal("'y' must not delete the remote branch")
 		}
@@ -492,10 +824,9 @@ func TestConfirmRemoteConfirmationSplit(t *testing.T) {
 		m.state = stateConfirm
 
 		nm, cmd := m.updateConfirm(key("R"))
-		if nm.(model).state != stateDeleting {
-			t.Fatalf("state should be stateDeleting, got %v", nm.(model).state)
-		}
-		runCmd(t, cmd)
+		wantState(t, nm.(model), stateDeleting, "state should be stateDeleting")
+		m = drainDeletions(t, nm.(model), cmd)
+		wantState(t, m, stateResult, "a clean -D run should land on the results screen")
 		if remoteHasBranch(t, repo, "feature/tracked") {
 			t.Fatal("'R' should delete the remote branch")
 		}
@@ -774,13 +1105,16 @@ func TestNonOriginRemoteResolves(t *testing.T) {
 	}
 }
 
-// origin is preferred when several remotes are configured.
+// origin is preferred when several remotes are configured. The names come out
+// of refs/remotes now, so the second remote has to be fetched to count — one
+// that has never been fetched holds no ref a default branch could resolve to.
 func TestRemotesPrefersOrigin(t *testing.T) {
 	repo := setupRepo(t)
 	chdir(t, repo)
 
 	git(t, repo, "remote", "add", "aaa-fork", repo)
-	got := remotes()
+	git(t, repo, "fetch", "-q", "aaa-fork")
+	got := loadRemoteRefs().names
 	if len(got) == 0 || got[0] != "origin" {
 		t.Fatalf("origin should sort first, got %v", got)
 	}
@@ -905,9 +1239,7 @@ func TestUnmergedBranchWithoutUpstreamIsWarned(t *testing.T) {
 	b.selected = true
 	nm, _ := m.updateList(key("d"))
 	m = nm.(model)
-	if m.state != stateConfirm {
-		t.Fatalf("'d' should open the confirm screen, got %v", m.state)
-	}
+	wantState(t, m, stateConfirm, "'d' should open the confirm screen")
 	b = find(m.branches, "feature/unmerged")
 	if b.riskCommits != 1 {
 		t.Fatalf("want the branch's 1 unique commit measured, got %d", b.riskCommits)
@@ -967,7 +1299,7 @@ func TestForcePromptStatesCommitCount(t *testing.T) {
 	}
 	find(m.branches, "feature/unmerged").selected = true
 	m.force = false
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 
 	failures := m.forceableFailures()
 	if len(failures) != 1 {
@@ -977,7 +1309,7 @@ func TestForcePromptStatesCommitCount(t *testing.T) {
 		t.Fatalf("the refused result must carry its measured cost, got %+v", failures[0])
 	}
 
-	m.state = stateForcePrompt
+	wantState(t, m, stateForcePrompt, "a refused -d must raise the force prompt")
 	out := stripANSI(m.forcePromptView())
 	if !strings.Contains(out, fmt.Sprintf("1 commit(s) not in %s will be lost", m.riskBase)) {
 		t.Fatalf("force prompt must state the commit count:\n%s", out)
@@ -1007,7 +1339,7 @@ func TestRemoteDeleteDeferredUntilLocalSucceeds(t *testing.T) {
 	tb.selected = true
 	tb.deleteRemote = true
 	m.force = false // safe delete, which git will refuse
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 
 	r := m.results[0]
 	if r.localOK {
@@ -1027,7 +1359,9 @@ func TestRemoteDeleteDeferredUntilLocalSucceeds(t *testing.T) {
 	}
 
 	// The force retry clears the branch, so the arming is finally honoured.
-	m.forceDeleteUnmerged()
+	wantState(t, m, stateForcePrompt, "a refused -d must raise the force prompt")
+	nm, _ := m.Update(key("y"))
+	m = nm.(model)
 	r = m.results[0]
 	if !r.localOK || !r.remoteTried || !r.remoteOK || r.remoteSkipped {
 		t.Fatalf("force retry should complete both deletes: %+v", r)
@@ -1122,7 +1456,7 @@ func TestTagShadowingBranchName(t *testing.T) {
 
 		// And the delete must land on the branch, leaving the tag alone.
 		m.force = true
-		m.performDeletions()
+		m = startAndDrain(t, m, true)
 		if !m.results[0].localOK {
 			t.Fatalf("delete failed: %s", m.results[0].localErr)
 		}
@@ -1148,7 +1482,7 @@ func TestTagShadowingBranchName(t *testing.T) {
 		git(t, repo, "tag", "main", "feature")
 		git(t, repo, "checkout", "-q", "trunk")
 
-		if got := localDefaultBranch(""); got != "" {
+		if got := localDefaultBranch("", gitHasBranch); got != "" {
 			t.Fatalf("a tag must not pose as the local default branch, got %q", got)
 		}
 		m, err := initialModel()
@@ -1183,7 +1517,7 @@ func TestTagShadowingBranchName(t *testing.T) {
 		tb.selected = true
 		tb.deleteRemote = true
 		m.force = true
-		m.performDeletions()
+		m = startAndDrain(t, m, true)
 
 		r := m.results[0]
 		if !r.localOK {
@@ -1343,7 +1677,7 @@ func TestGoneCurrentBranchIsNotPruned(t *testing.T) {
 	// Selected by hand, git refuses — a failure -D cannot rescue, so it must not
 	// raise the force prompt offering a retry that fails identically.
 	b.selected = true
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 	if len(m.results) != 1 || m.results[0].localOK {
 		t.Fatalf("deleting the checked-out branch must fail: %+v", m.results)
 	}
@@ -1375,7 +1709,7 @@ func TestLocalOnlyRepo(t *testing.T) {
 	repo := setupLocalRepo(t)
 	chdir(t, repo)
 
-	if got := remotes(); len(got) != 0 {
+	if got := loadRemoteRefs().names; len(got) != 0 {
 		t.Fatalf("no remotes should be configured, got %v", got)
 	}
 	if got := remoteDefault(); got != "" {
@@ -1418,7 +1752,7 @@ func TestLocalOnlyRepo(t *testing.T) {
 	// above (it survives the fetch), so clear it first.
 	find(m.branches, "feature/unmerged").selected = false
 	find(m.branches, "feature/merged").selected = true
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 	if len(m.results) != 1 || !m.results[0].localOK {
 		t.Fatalf("merged branch should delete cleanly: %+v", m.results)
 	}
@@ -1508,7 +1842,7 @@ func TestDetachedHead(t *testing.T) {
 	nm, _ = m.updateList(key("n"))
 	m = nm.(model)
 	find(m.branches, "main").selected = true
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 	if len(m.results) != 1 || !m.results[0].localOK {
 		t.Fatalf("main should delete cleanly while detached: %+v", m.results)
 	}
@@ -1555,11 +1889,11 @@ func TestNonStandardDefaultBranch(t *testing.T) {
 
 		// The same holds on the force prompt reached after a refused safe delete.
 		m.force = false
-		m.performDeletions()
+		m = startAndDrain(t, m, true)
 		if len(m.forceableFailures()) != 1 {
 			t.Fatalf("the unmerged branch should be refused and forceable: %+v", m.results)
 		}
-		m.state = stateForcePrompt
+		wantState(t, m, stateForcePrompt, "a refused -d must raise the force prompt")
 		if out := stripANSI(m.forcePromptView()); !strings.Contains(out, "no base branch to compare against") {
 			t.Fatalf("force prompt must carry the warning:\n%s", out)
 		}
@@ -1623,7 +1957,7 @@ func TestUnreachableRemote(t *testing.T) {
 	tb = find(m.branches, "feature/tracked")
 	tb.selected = true
 	tb.deleteRemote = true
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 
 	r := m.results[0]
 	if !r.localOK {
@@ -1723,7 +2057,7 @@ func TestRemoteDeleteRace(t *testing.T) {
 	}
 	tb.selected = true
 	tb.deleteRemote = true
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 
 	r := m.results[0]
 	if !r.localOK {
@@ -1845,7 +2179,7 @@ func TestUnicodeNameAndEmptySubject(t *testing.T) {
 	// And it deletes end to end, the name surviving the round trip to git.
 	b.selected = true
 	m.force = true
-	m.performDeletions()
+	m = startAndDrain(t, m, true)
 	if !m.results[0].localOK {
 		t.Fatalf("delete failed: %s", m.results[0].localErr)
 	}
@@ -1860,6 +2194,200 @@ func TestVersionString(t *testing.T) {
 	for _, want := range []string{"git_pruner", "commit:", "date:", "go:"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("version output missing %q:\n%s", want, s)
+		}
+	}
+}
+
+// setupGoneMerged builds n branches that are merged into main and report their
+// upstream as gone. The upstream is configured rather than pushed and pruned:
+// git reads "gone" straight out of the config when the remote-tracking ref is
+// absent, which keeps the fixture free of network work.
+func setupGoneMerged(t *testing.T, n int) string {
+	t.Helper()
+	tmp := initRepo(t, "main")
+	commitFile(t, tmp, "a", "a")
+	git(t, tmp, "remote", "add", "origin", filepath.Join(t.TempDir(), "absent.git"))
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("feature/%d", i)
+		git(t, tmp, "checkout", "-q", "-b", name, "main")
+		commitFile(t, tmp, fmt.Sprintf("f%d", i), name)
+		git(t, tmp, "checkout", "-q", "main")
+		git(t, tmp, "merge", "-q", "--no-ff", name, "-m", "m"+name)
+		git(t, tmp, "config", "branch."+name+".remote", "origin")
+		git(t, tmp, "config", "branch."+name+".merge", "refs/heads/"+name)
+	}
+	return tmp
+}
+
+// A branch whose tip is already in the base has an empty base..branch range, so
+// `git cherry` can only report nothing. One `branch --merged` query answers that
+// for the whole list, and it has to stay one query: a subprocess per branch put
+// half a second on the load of every repo full of pruned branches.
+func TestMergedBranchesCostNoSubprocess(t *testing.T) {
+	const n = 30
+	chdir(t, setupGoneMerged(t, n))
+
+	before := gitProcs.total.Load()
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	spawned := gitProcs.total.Load() - before
+
+	// A literal bound, not a formula over n: a fan-out that comes back must fail
+	// this rather than scale along with it.
+	const fewProcesses = 12
+	if spawned > fewProcesses {
+		t.Fatalf("loading %d merged branches ran %d git processes; it should not grow with the branch count", n, spawned)
+	}
+
+	measured := 0
+	for _, b := range m.branches {
+		if !b.gone {
+			continue
+		}
+		if !b.riskMeasured {
+			t.Fatalf("%s was never measured, so p cannot tell whether it is safe to select", b.name)
+		}
+		if b.riskCommits != 0 {
+			t.Fatalf("%s is merged into the base; the shortcut must agree with git cherry, got %d", b.name, b.riskCommits)
+		}
+		measured++
+	}
+	if measured != n {
+		t.Fatalf("expected %d gone branches, saw %d", n, measured)
+	}
+}
+
+// The shortcut must not swallow the branches it cannot answer for: one that is
+// merged and one that is not have to come back with the counts git cherry gives.
+func TestUnmergedBranchIsStillMeasured(t *testing.T) {
+	repo := setupGoneMerged(t, 1) // feature/0: merged, gone
+	chdir(t, repo)
+
+	git(t, repo, "checkout", "-q", "-b", "feature/kept", "main")
+	commitFile(t, repo, "kept", "kept")
+	git(t, repo, "checkout", "-q", "main")
+	git(t, repo, "config", "branch.feature/kept.remote", "origin")
+	git(t, repo, "config", "branch.feature/kept.merge", "refs/heads/feature/kept")
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := find(m.branches, "feature/0"); b == nil || b.riskCommits != 0 {
+		t.Fatalf("the merged branch should cost nothing: %+v", b)
+	}
+	kept := find(m.branches, "feature/kept")
+	if kept == nil || !kept.riskMeasured || kept.riskCommits != 1 {
+		t.Fatalf("the unmerged branch still needs its real count: %+v", kept)
+	}
+}
+
+// screenRows counts the rows a rendered view occupies.
+func screenRows(view string) int { return len(strings.Split(strings.TrimRight(view, "\n"), "\n")) }
+
+// The confirm screen asks a question whose answer deletes branches. A wide
+// selection used to render every branch in full, pushing that question past the
+// last row of the terminal — the user answered a prompt they could not read.
+func TestConfirmPromptStaysOnScreen(t *testing.T) {
+	const n = 30
+	chdir(t, setupGoneMerged(t, n))
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectAll(&m, false)
+	next, _ := m.Update(key("d"))
+	m = next.(model)
+	wantState(t, m, stateConfirm, "d with a selection opens the confirm screen")
+
+	view := m.confirmView()
+	if rows := screenRows(view); rows > m.height {
+		t.Fatalf("%d selected branches rendered %d rows into a %d-row terminal", n, rows, m.height)
+	}
+	if !strings.Contains(stripANSI(view), "Delete these branches?") {
+		t.Fatalf("the prompt must be on the screen:\n%s", stripANSI(view))
+	}
+}
+
+// Windowing must not hide a branch from the user: every one of them has to be
+// reachable by scrolling, and the prompt has to stay put while they do it.
+func TestConfirmScrollReachesTheLastBranch(t *testing.T) {
+	const n = 30
+	chdir(t, setupGoneMerged(t, n))
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectAll(&m, false)
+	m.state = stateConfirm
+
+	sel := m.selectedBranches()
+	last := sel[len(sel)-1].name // the confirm list follows the sort order
+	if strings.Contains(stripANSI(m.confirmView()), last) {
+		t.Fatalf("%s should start below the window; the fixture proves nothing", last)
+	}
+
+	next, _ := m.Update(key("G"))
+	m = next.(model)
+	view := stripANSI(m.confirmView())
+	if !strings.Contains(view, last) {
+		t.Fatalf("G must reach the last branch:\n%s", view)
+	}
+	if !strings.Contains(view, "Delete these branches?") {
+		t.Fatalf("the prompt must survive scrolling:\n%s", view)
+	}
+	if rows := screenRows(m.confirmView()); rows > m.height {
+		t.Fatalf("the scrolled screen is %d rows in a %d-row terminal", rows, m.height)
+	}
+
+	// The answer keys still answer; they are not swallowed by the scroll handler.
+	next, _ = m.Update(key("n"))
+	wantState(t, next.(model), stateList, "n cancels from a scrolled confirm screen")
+}
+
+// The results screen has the same shape and the same failure: a wide prune used
+// to bury "press q/enter to quit" under its own output.
+func TestResultViewWindowsItsBody(t *testing.T) {
+	m := model{height: 24, width: 100, state: stateResult}
+	for i := 0; i < 40; i++ {
+		m.results = append(m.results, deleteResult{
+			br: branch{name: "feature/" + strconv.Itoa(i)}, done: true, localOK: true,
+		})
+	}
+	if rows := screenRows(m.resultView()); rows > m.height {
+		t.Fatalf("40 results rendered %d rows into a %d-row terminal", rows, m.height)
+	}
+	if !strings.Contains(stripANSI(m.resultView()), "press q/enter to quit") {
+		t.Fatal("the footer must stay on the screen")
+	}
+
+	next, _ := m.Update(key("G"))
+	m = next.(model)
+	if o := stripANSI(m.resultView()); !strings.Contains(o, "feature/39") {
+		t.Fatalf("G must reach the last result:\n%s", o)
+	}
+}
+
+// A body that fits needs no position line and no scrolling — the common case
+// must not grow furniture it does not need.
+func TestShortBodyRendersWhole(t *testing.T) {
+	m := model{height: 24, width: 100, state: stateResult}
+	for i := 0; i < 3; i++ {
+		m.results = append(m.results, deleteResult{
+			br: branch{name: "feature/" + strconv.Itoa(i)}, done: true, localOK: true,
+		})
+	}
+	out := stripANSI(m.resultView())
+	if strings.Contains(out, "scroll") {
+		t.Fatalf("a body that fits should show no position line:\n%s", out)
+	}
+	for i := 0; i < 3; i++ {
+		if !strings.Contains(out, "feature/"+strconv.Itoa(i)) {
+			t.Fatalf("every result must be shown:\n%s", out)
 		}
 	}
 }

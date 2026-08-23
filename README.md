@@ -69,6 +69,10 @@ checklist), so the UI stays responsive while remote pushes complete.
 In the diff view: `↑`/`↓` scroll, `space`/`ctrl+d` page down, `ctrl+u`/`pgup` page up,
 `g`/`G` jump to top/bottom, and `q`/`esc`/`v` return to the list.
 
+The confirmation, force-delete, progress and results screens scroll with the same keys, so a
+wide selection never pushes the prompt off the bottom of the terminal. The answer keys take
+precedence, so `y`, `R` and `n` still work while a list is scrolled.
+
 ## Row format
 
 ![The branch list: selection, track and merge columns, dates, hashes and subjects](assets/branches.png)
