@@ -143,6 +143,59 @@ bounds rather than the constants, so raising a cap breaks it instead of moving w
 The earlier "60 parallel deletes succeeded" note below still stands, but it only ever covered
 local ref locking. It says nothing about the network.
 
+**16. A `git cherry` subprocess per branch, for an answer one query already held.** `measureRisk`
+ran `git cherry <base> <branch>` for every gone branch. A branch whose tip is already an ancestor
+of the base has an empty `base..branch` range, so `git cherry` can only report nothing — and on
+the tool's headline case, a repo full of branches that were merged and then pruned, that is nearly
+every one of them.
+
+`refreshMergeInfo` now runs one `git branch --merged <base>` and caches the result in
+`m.baseMerged`; `measureRisk` reads the set instead of starting a process. Measured on the same
+101-branch fixture (100 gone, all merged): startup **529ms → 45ms**, peak concurrent git
+processes 8 → 2. One query at 9ms replaced 30 `git cherry` calls at 330ms on a 30-branch probe.
+
+`TestMergedBranchesCostNoSubprocess` asserts a literal process bound rather than a time, and fails
+at 39 processes when the shortcut is removed.
+
+**17. The confirm screen rendered its whole body, pushing its own question off the terminal.**
+`confirmView` wrote every selected branch in full. With 40 selected that is 206 rows into a 24-row
+terminal, with `Delete these branches?` on row 205 — the user answered a prompt they could not
+read. `forcePromptView`, `resultView` and `deletingView` had the same shape.
+
+All four now go through `page(header, body, footer)`, which renders the header, a window into the
+body, and the footer, plus a position line when the body does not fit. `scrollKeys` adds ↑/↓,
+space, ctrl+d/u, pgup/pgdn and g/G, and the mouse wheel scrolls them; each screen answers its own
+keys first, so `y`, `R` and `n` are never swallowed. Rendering only the visible rows also takes
+the per-frame cost off the length of the list.
+
+**18. Startup was six git subprocesses deep, and the depth was the whole cost.** On this repo
+(3 branches) startup was 34ms, all of it process-start latency — one `git` costs ~6.5ms to spawn,
+and the chain ran `rev-parse` → `for-each-ref` → `remote` → `symbolic-ref` → `branch -r --merged`
+→ `branch --merged <base>` in sequence. Only `branch --merged HEAD` overlapped anything.
+
+Three changes, together taking the chain to two rounds:
+
+- `loadRemoteRefs` reads `refs/remotes` once with `--format='%(refname)%00%(symref)'`. That single
+  call replaces `git remote`, a `symbolic-ref` per remote and a `rev-parse --verify` per candidate.
+  `%(symref)` yields the full ref, so it keeps the tag-shadowing guarantee `symbolic-ref --short`
+  would break. Remote names now come out of the refs: a remote with no fetched refs holds nothing
+  a default branch could resolve to, so nothing is lost.
+- `localDefaultBranch` takes a `has(name)` predicate. `refreshMergeInfo` passes a lookup into the
+  branch list it already holds; only `baseBranch`, which has no list, still pays `gitHasBranch`.
+- `loadRepo` starts `loadBranches`, `localMergedSet` and `loadRemoteRefs` in one round, and
+  `initialModel` runs the repo check beside them rather than ahead of them. `refreshMergeInfo`
+  then runs `branch -r --merged` and `branch --merged <base>` as a second round.
+
+| repo | before | after |
+| ---- | ------ | ----- |
+| this one (3 branches)                | 34ms | 19ms |
+| 101 branches, 100 gone (with item 16)| 529ms | 17ms |
+| 501 branches                         | 90ms | 77ms |
+
+The 501-branch case is `for-each-ref`'s own work (42ms of the 77ms), not chain depth — measured at
+15ms for `%(refname)` alone against 42ms for the full format, so the commit-object reads behind
+`%(committerdate)` are the floor there.
+
 ### Also completed
 
 - `LICENSE` (MIT)
@@ -157,9 +210,11 @@ local ref locking. It says nothing about the network.
 
 **5. Blocking git calls inside `Update`.** `loadDiff` (`v`), `refreshMergeInfo` and
 `reloadBranches` still run synchronously in the update loop, so what remains of their cost is
-still a freeze. The per-branch measurement that dominated them has been parallelised (see item 14
-under Completed); the residue is ~370ms on a 100-gone-branch repo. Moving them onto the `tea.Cmd`
-pattern already used for fetch would take that to zero.
+still a freeze. Items 14, 16 and 18 under Completed took the residue to ~16ms on a
+100-gone-branch repo, so this is no longer a visible freeze — what it would still buy is the
+first paint, which currently waits on the whole two-round load. Moving `refreshMergeInfo` onto
+the `tea.Cmd` pattern already used for fetch would put the branch list on screen after one
+subprocess (~7ms) and fill the ✓ and risk columns in behind it.
 
 Do not reach for `git branch -r --merged` first: it was measured at 100ms with 2000 remote
 refs, roughly a tenth of what the `git cherry` loop beside it cost.
@@ -180,7 +235,6 @@ Set `GIT_TERMINAL_PROMPT=0` and attach a `context.WithTimeout` so it fails fast 
 - ANSI and control characters in commit subjects and branch names render raw into the terminal.
   Confirmed: a `\x1b[31m` in a subject reaches the row intact (a bare `BEL` is stripped by
   `ansi.Truncate`). The text comes from fetched branches, so it is not the author's to trust.
-- `applyBranches` silently discards the user's existing selections on `p`.
 - The cursor starts on an arbitrary row. `sortBranches` preserves the cursor by name
   unconditionally, but at startup `cursor` is 0 and `branches` is still in `for-each-ref`
   (alphabetical) order, so it pins the cursor to wherever the alphabetically-first branch

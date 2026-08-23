@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1103,13 +1105,16 @@ func TestNonOriginRemoteResolves(t *testing.T) {
 	}
 }
 
-// origin is preferred when several remotes are configured.
+// origin is preferred when several remotes are configured. The names come out
+// of refs/remotes now, so the second remote has to be fetched to count — one
+// that has never been fetched holds no ref a default branch could resolve to.
 func TestRemotesPrefersOrigin(t *testing.T) {
 	repo := setupRepo(t)
 	chdir(t, repo)
 
 	git(t, repo, "remote", "add", "aaa-fork", repo)
-	got := remotes()
+	git(t, repo, "fetch", "-q", "aaa-fork")
+	got := loadRemoteRefs().names
 	if len(got) == 0 || got[0] != "origin" {
 		t.Fatalf("origin should sort first, got %v", got)
 	}
@@ -1477,7 +1482,7 @@ func TestTagShadowingBranchName(t *testing.T) {
 		git(t, repo, "tag", "main", "feature")
 		git(t, repo, "checkout", "-q", "trunk")
 
-		if got := localDefaultBranch(""); got != "" {
+		if got := localDefaultBranch("", gitHasBranch); got != "" {
 			t.Fatalf("a tag must not pose as the local default branch, got %q", got)
 		}
 		m, err := initialModel()
@@ -1704,7 +1709,7 @@ func TestLocalOnlyRepo(t *testing.T) {
 	repo := setupLocalRepo(t)
 	chdir(t, repo)
 
-	if got := remotes(); len(got) != 0 {
+	if got := loadRemoteRefs().names; len(got) != 0 {
 		t.Fatalf("no remotes should be configured, got %v", got)
 	}
 	if got := remoteDefault(); got != "" {
@@ -2189,6 +2194,200 @@ func TestVersionString(t *testing.T) {
 	for _, want := range []string{"git_pruner", "commit:", "date:", "go:"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("version output missing %q:\n%s", want, s)
+		}
+	}
+}
+
+// setupGoneMerged builds n branches that are merged into main and report their
+// upstream as gone. The upstream is configured rather than pushed and pruned:
+// git reads "gone" straight out of the config when the remote-tracking ref is
+// absent, which keeps the fixture free of network work.
+func setupGoneMerged(t *testing.T, n int) string {
+	t.Helper()
+	tmp := initRepo(t, "main")
+	commitFile(t, tmp, "a", "a")
+	git(t, tmp, "remote", "add", "origin", filepath.Join(t.TempDir(), "absent.git"))
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("feature/%d", i)
+		git(t, tmp, "checkout", "-q", "-b", name, "main")
+		commitFile(t, tmp, fmt.Sprintf("f%d", i), name)
+		git(t, tmp, "checkout", "-q", "main")
+		git(t, tmp, "merge", "-q", "--no-ff", name, "-m", "m"+name)
+		git(t, tmp, "config", "branch."+name+".remote", "origin")
+		git(t, tmp, "config", "branch."+name+".merge", "refs/heads/"+name)
+	}
+	return tmp
+}
+
+// A branch whose tip is already in the base has an empty base..branch range, so
+// `git cherry` can only report nothing. One `branch --merged` query answers that
+// for the whole list, and it has to stay one query: a subprocess per branch put
+// half a second on the load of every repo full of pruned branches.
+func TestMergedBranchesCostNoSubprocess(t *testing.T) {
+	const n = 30
+	chdir(t, setupGoneMerged(t, n))
+
+	before := gitProcs.total.Load()
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	spawned := gitProcs.total.Load() - before
+
+	// A literal bound, not a formula over n: a fan-out that comes back must fail
+	// this rather than scale along with it.
+	const fewProcesses = 12
+	if spawned > fewProcesses {
+		t.Fatalf("loading %d merged branches ran %d git processes; it should not grow with the branch count", n, spawned)
+	}
+
+	measured := 0
+	for _, b := range m.branches {
+		if !b.gone {
+			continue
+		}
+		if !b.riskMeasured {
+			t.Fatalf("%s was never measured, so p cannot tell whether it is safe to select", b.name)
+		}
+		if b.riskCommits != 0 {
+			t.Fatalf("%s is merged into the base; the shortcut must agree with git cherry, got %d", b.name, b.riskCommits)
+		}
+		measured++
+	}
+	if measured != n {
+		t.Fatalf("expected %d gone branches, saw %d", n, measured)
+	}
+}
+
+// The shortcut must not swallow the branches it cannot answer for: one that is
+// merged and one that is not have to come back with the counts git cherry gives.
+func TestUnmergedBranchIsStillMeasured(t *testing.T) {
+	repo := setupGoneMerged(t, 1) // feature/0: merged, gone
+	chdir(t, repo)
+
+	git(t, repo, "checkout", "-q", "-b", "feature/kept", "main")
+	commitFile(t, repo, "kept", "kept")
+	git(t, repo, "checkout", "-q", "main")
+	git(t, repo, "config", "branch.feature/kept.remote", "origin")
+	git(t, repo, "config", "branch.feature/kept.merge", "refs/heads/feature/kept")
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := find(m.branches, "feature/0"); b == nil || b.riskCommits != 0 {
+		t.Fatalf("the merged branch should cost nothing: %+v", b)
+	}
+	kept := find(m.branches, "feature/kept")
+	if kept == nil || !kept.riskMeasured || kept.riskCommits != 1 {
+		t.Fatalf("the unmerged branch still needs its real count: %+v", kept)
+	}
+}
+
+// screenRows counts the rows a rendered view occupies.
+func screenRows(view string) int { return len(strings.Split(strings.TrimRight(view, "\n"), "\n")) }
+
+// The confirm screen asks a question whose answer deletes branches. A wide
+// selection used to render every branch in full, pushing that question past the
+// last row of the terminal — the user answered a prompt they could not read.
+func TestConfirmPromptStaysOnScreen(t *testing.T) {
+	const n = 30
+	chdir(t, setupGoneMerged(t, n))
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectAll(&m, false)
+	next, _ := m.Update(key("d"))
+	m = next.(model)
+	wantState(t, m, stateConfirm, "d with a selection opens the confirm screen")
+
+	view := m.confirmView()
+	if rows := screenRows(view); rows > m.height {
+		t.Fatalf("%d selected branches rendered %d rows into a %d-row terminal", n, rows, m.height)
+	}
+	if !strings.Contains(stripANSI(view), "Delete these branches?") {
+		t.Fatalf("the prompt must be on the screen:\n%s", stripANSI(view))
+	}
+}
+
+// Windowing must not hide a branch from the user: every one of them has to be
+// reachable by scrolling, and the prompt has to stay put while they do it.
+func TestConfirmScrollReachesTheLastBranch(t *testing.T) {
+	const n = 30
+	chdir(t, setupGoneMerged(t, n))
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectAll(&m, false)
+	m.state = stateConfirm
+
+	sel := m.selectedBranches()
+	last := sel[len(sel)-1].name // the confirm list follows the sort order
+	if strings.Contains(stripANSI(m.confirmView()), last) {
+		t.Fatalf("%s should start below the window; the fixture proves nothing", last)
+	}
+
+	next, _ := m.Update(key("G"))
+	m = next.(model)
+	view := stripANSI(m.confirmView())
+	if !strings.Contains(view, last) {
+		t.Fatalf("G must reach the last branch:\n%s", view)
+	}
+	if !strings.Contains(view, "Delete these branches?") {
+		t.Fatalf("the prompt must survive scrolling:\n%s", view)
+	}
+	if rows := screenRows(m.confirmView()); rows > m.height {
+		t.Fatalf("the scrolled screen is %d rows in a %d-row terminal", rows, m.height)
+	}
+
+	// The answer keys still answer; they are not swallowed by the scroll handler.
+	next, _ = m.Update(key("n"))
+	wantState(t, next.(model), stateList, "n cancels from a scrolled confirm screen")
+}
+
+// The results screen has the same shape and the same failure: a wide prune used
+// to bury "press q/enter to quit" under its own output.
+func TestResultViewWindowsItsBody(t *testing.T) {
+	m := model{height: 24, width: 100, state: stateResult}
+	for i := 0; i < 40; i++ {
+		m.results = append(m.results, deleteResult{
+			br: branch{name: "feature/" + strconv.Itoa(i)}, done: true, localOK: true,
+		})
+	}
+	if rows := screenRows(m.resultView()); rows > m.height {
+		t.Fatalf("40 results rendered %d rows into a %d-row terminal", rows, m.height)
+	}
+	if !strings.Contains(stripANSI(m.resultView()), "press q/enter to quit") {
+		t.Fatal("the footer must stay on the screen")
+	}
+
+	next, _ := m.Update(key("G"))
+	m = next.(model)
+	if o := stripANSI(m.resultView()); !strings.Contains(o, "feature/39") {
+		t.Fatalf("G must reach the last result:\n%s", o)
+	}
+}
+
+// A body that fits needs no position line and no scrolling — the common case
+// must not grow furniture it does not need.
+func TestShortBodyRendersWhole(t *testing.T) {
+	m := model{height: 24, width: 100, state: stateResult}
+	for i := 0; i < 3; i++ {
+		m.results = append(m.results, deleteResult{
+			br: branch{name: "feature/" + strconv.Itoa(i)}, done: true, localOK: true,
+		})
+	}
+	out := stripANSI(m.resultView())
+	if strings.Contains(out, "scroll") {
+		t.Fatalf("a body that fits should show no position line:\n%s", out)
+	}
+	for i := 0; i < 3; i++ {
+		if !strings.Contains(out, "feature/"+strconv.Itoa(i)) {
+			t.Fatalf("every result must be shown:\n%s", out)
 		}
 	}
 }

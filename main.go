@@ -136,6 +136,10 @@ type model struct {
 	remoteDefault string // resolved remote default branch, e.g. "origin/main"
 	riskBase      string // ref that branch.riskCommits is measured against ("" if unresolved)
 	riskBaseRef   string // riskBase fully qualified, so a same-named tag cannot shadow it
+	// baseMerged holds the local branches whose tip is an ancestor of riskBaseRef.
+	// Their riskCommits is 0 by definition, so one query here removes a `git
+	// cherry` subprocess per branch (see measureRisk).
+	baseMerged map[string]bool
 
 	spinnerFrame int // animation frame for the deleting spinner (deletion counts derive from results)
 
@@ -143,6 +147,8 @@ type model struct {
 	diffBase   string   // base ref the diff was computed against
 	diffLines  []string // raw lines of the diff being viewed
 	diffTop    int      // scroll offset within diffLines
+
+	bodyTop int // scroll offset within the confirm/force/result body (see page)
 
 	width, height int
 	err           string
@@ -203,9 +209,12 @@ func networkBound(args []string) bool {
 // the subprocesses rather than on the slots, so a test can tell a cap that works
 // from one that was removed — instrumenting the cap would stop reporting along
 // with it.
-type gauge struct{ inFlight, peak atomic.Int64 }
+// It also counts every holder, which is what tells a fan-out that was removed
+// from one that merely runs fast on a small fixture.
+type gauge struct{ inFlight, peak, total atomic.Int64 }
 
 func (g *gauge) enter() {
+	g.total.Add(1)
 	n := g.inFlight.Add(1)
 	for {
 		peak := g.peak.Load()
@@ -334,59 +343,92 @@ func loadBranches() ([]branch, error) {
 	return branches, nil
 }
 
-// remotes lists the configured remotes with "origin" first, so the conventional
-// remote wins when several exist while repos whose only remote is named
-// something else (upstream, fork, …) still resolve a default branch.
-func remotes() []string {
-	out, err := runGit("remote")
+// remoteRefs is one read of refs/remotes: which remote-tracking refs exist, and
+// what each symbolic one points at. Reading them together is what replaces `git
+// remote`, a `symbolic-ref` per remote and a `rev-parse --verify` per candidate
+// — five subprocess starts on an ordinary one-remote repo, against this one.
+type remoteRefs struct {
+	names  []string          // remote names, "origin" first
+	exists map[string]bool   // fully qualified ref -> present
+	symref map[string]string // fully qualified symbolic ref -> the ref it names
+}
+
+// loadRemoteRefs reads every remote-tracking ref in one call. The remote names
+// come out of the refs rather than out of `git remote`: a remote with no fetched
+// refs cannot supply a default branch, so it is nothing the caller could use.
+func loadRemoteRefs() remoteRefs {
+	rr := remoteRefs{exists: map[string]bool{}, symref: map[string]string{}}
+	out, err := runGit("for-each-ref", "--format=%(refname)%00%(symref)", "refs/remotes")
 	if err != nil {
-		return nil
+		return rr
 	}
-	var names []string
+	seen := map[string]bool{}
 	for _, line := range strings.Split(out, "\n") {
+		ref, target := "", ""
 		if s := strings.TrimSpace(line); s != "" {
-			names = append(names, s)
+			ref, target, _ = strings.Cut(s, "\x00")
+		}
+		if ref == "" {
+			continue
+		}
+		rr.exists[ref] = true
+		if target != "" {
+			rr.symref[ref] = target
+		}
+		// The first segment after the namespace is the remote's name.
+		if name, _, ok := strings.Cut(shortRef(ref), "/"); ok && !seen[name] {
+			seen[name] = true
+			rr.names = append(rr.names, name)
 		}
 	}
-	sort.SliceStable(names, func(i, j int) bool { return names[i] == "origin" && names[j] != "origin" })
-	return names
+	// origin first, so the conventional remote wins when several exist while a
+	// repo whose only remote is named something else (upstream, fork, …) still
+	// resolves a default branch.
+	sort.SliceStable(rr.names, func(i, j int) bool { return rr.names[i] == "origin" && rr.names[j] != "origin" })
+	return rr
 }
+
+// defaultBranchNames are the branch names treated as a repo's trunk, in order of
+// preference.
+var defaultBranchNames = []string{"main", "master"}
 
 // localDefaultBranch returns the ref of a local main/master, skipping exclude (a
 // short branch name) so a branch is never compared against itself. Returns ""
-// when neither exists.
+// when neither exists. has answers whether a local branch of that name exists;
+// a caller already holding the branch list passes a lookup into it rather than
+// paying a subprocess per candidate.
 //
 // The resolvers below all return fully qualified refs, and the display layer
 // shortens them with shortRef. Resolving is the only place the namespace is
 // known for certain, so carrying it forward from here is what keeps a same-named
 // tag from being measured in place of the branch further down.
-func localDefaultBranch(exclude string) string {
-	for _, c := range []string{"main", "master"} {
-		if c == exclude {
-			continue
-		}
-		if ref := branchRef(c); refExists(ref) {
-			return ref
+func localDefaultBranch(exclude string, has func(string) bool) string {
+	for _, c := range defaultBranchNames {
+		if c != exclude && has(c) {
+			return branchRef(c)
 		}
 	}
 	return ""
 }
 
-// remoteDefault resolves the remote's default branch as a remote-tracking ref
-// (e.g. "refs/remotes/origin/main"): <remote>/HEAD if set, else <remote>/main,
-// else <remote>/master, trying each remote in turn. Returns "" when none can be
-// found.
-func remoteDefault() string {
-	for _, r := range remotes() {
-		// Deliberately not symbolic-ref --short: it shortens to the shortest
-		// *unambiguous* name, which a same-named tag turns into "remotes/origin/main".
-		if out, err := runGit("symbolic-ref", "refs/remotes/"+r+"/HEAD"); err == nil {
-			if s := strings.TrimSpace(out); s != "" {
-				return s
-			}
+// gitHasBranch is the localDefaultBranch lookup for callers with no branch list
+// to hand — it costs a subprocess per candidate.
+func gitHasBranch(name string) bool { return refExists(branchRef(name)) }
+
+// remoteDefaultFrom resolves the remote's default branch as a remote-tracking
+// ref (e.g. "refs/remotes/origin/main"): <remote>/HEAD if set, else
+// <remote>/main, else <remote>/master, trying each remote in turn. Returns ""
+// when none can be found.
+func remoteDefaultFrom(rr remoteRefs) string {
+	for _, r := range rr.names {
+		// %(symref) yields the full ref, unlike `symbolic-ref --short`, which
+		// gives the shortest *unambiguous* name — "remotes/origin/main" as soon
+		// as a tag shares the name.
+		if t := rr.symref["refs/remotes/"+r+"/HEAD"]; t != "" {
+			return t
 		}
-		for _, c := range []string{r + "/main", r + "/master"} {
-			if ref := "refs/remotes/" + c; refExists(ref) {
+		for _, c := range defaultBranchNames {
+			if ref := "refs/remotes/" + r + "/" + c; rr.exists[ref] {
 				return ref
 			}
 		}
@@ -394,13 +436,17 @@ func remoteDefault() string {
 	return ""
 }
 
+// remoteDefault reads the remote-tracking refs and resolves the default branch
+// from them.
+func remoteDefault() string { return remoteDefaultFrom(loadRemoteRefs()) }
+
 // baseBranch returns the ref to diff a branch against: the remote default branch,
 // else a local main/master, excluding name itself.
 func baseBranch(name string) string {
 	if def := remoteDefault(); def != "" {
 		return def
 	}
-	return localDefaultBranch(name)
+	return localDefaultBranch(name, gitHasBranch)
 }
 
 // riskCommitCount counts commits on name whose patch is not already present in
@@ -459,6 +505,32 @@ func remoteMergedSet(def string) map[string]bool {
 // git call covers the whole list, so this costs nothing per branch.
 func localMergedSet() map[string]bool { return mergedSet("branch", "--merged", "HEAD") }
 
+// repoReads holds the reads that do not depend on the branch list, so they can
+// run in the same round as it.
+type repoReads struct {
+	headMerged map[string]bool // local branches merged into HEAD
+	remotes    remoteRefs
+}
+
+// loadRepo reads the branch list and everything independent of it in one round.
+// Starting a git subprocess costs about 6ms, and none of these three waits on
+// another, so the depth of the chain is what the user waits on — not the work
+// inside it.
+func loadRepo() ([]branch, repoReads, error) {
+	var (
+		branches []branch
+		err      error
+		reads    repoReads
+	)
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); branches, err = loadBranches() }()
+	go func() { defer wg.Done(); reads.headMerged = localMergedSet() }()
+	go func() { defer wg.Done(); reads.remotes = loadRemoteRefs() }()
+	wg.Wait()
+	return branches, reads, err
+}
+
 // fetchDoneMsg reports completion of an async `git fetch --all --prune`.
 type fetchDoneMsg struct{ err error }
 
@@ -514,17 +586,26 @@ func loadDiff(name string) (diff, base string, err error) {
 // ---- model ----
 
 func initialModel() (model, error) {
-	if _, err := runGit("rev-parse", "--is-inside-work-tree"); err != nil {
+	// The repo check runs beside the reads rather than ahead of them. It is here
+	// to give a clearer message than git's own, not to gate the work, and a
+	// serial subprocess start is most of what startup costs.
+	var repoErr error
+	checked := make(chan struct{})
+	go func() {
+		_, repoErr = runGit("rev-parse", "--is-inside-work-tree")
+		close(checked)
+	}()
+	branches, reads, err := loadRepo()
+	<-checked
+
+	if repoErr != nil {
 		return model{}, fmt.Errorf("not a git repository (or git is unavailable)")
 	}
-	branches, err := loadBranches()
 	if err != nil {
 		return model{}, err
 	}
-	m := model{branches: branches, field: sortDate, ascending: false, height: 24, width: 100}
-	m.recomputeNameWidth()
-	m.refreshMergeInfo()
-	m.sortBranches()
+	m := model{field: sortDate, ascending: false, height: 24, width: 100}
+	m.applyBranches(branches, reads)
 	return m, nil
 }
 
@@ -574,6 +655,9 @@ func (m *model) scroll(delta int) {
 	case stateDiff:
 		m.diffTop += delta * 3 // 3 lines per wheel notch, like a pager
 		m.clampDiff()
+	case stateConfirm, stateForcePrompt, stateDeleting, stateResult:
+		m.bodyTop += delta * 3
+		m.clampBody()
 	}
 }
 
@@ -624,10 +708,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = ""
 			return m, nil
 		}
-		if branches, err := loadBranches(); err == nil {
+		if branches, reads, err := loadRepo(); err == nil {
 			// A fetch is non-destructive, so both the cursor (by name, in
 			// sortBranches) and the user's pending marks survive it.
-			m.applyBranches(carryMarks(m.branches, branches))
+			m.applyBranches(carryMarks(m.branches, branches), reads)
 		}
 		// Auto-select only gone branches that carry nothing missing from the
 		// base. Ones holding unique commits are left unselected so discarding
@@ -662,6 +746,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.deletesDone() >= len(m.results) {
 			m.reloadBranches()
+			m.bodyTop = 0
 			if len(m.forceableFailures()) > 0 {
 				m.state = stateForcePrompt
 			} else {
@@ -704,6 +789,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "q", "ctrl+c", "enter", "esc":
 				return m, tea.Quit
+			default:
+				m.scrollKeys(msg.String())
 			}
 		case stateHelp:
 			if msg.String() == "ctrl+c" {
@@ -788,7 +875,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d", "enter":
 		if len(m.selectedBranches()) > 0 {
 			m.measureSelectedRisk() // the confirm screen states what each delete costs
-			m.state = stateConfirm
+			m.state, m.bodyTop = stateConfirm, 0
 		}
 	}
 	return m, nil
@@ -808,6 +895,8 @@ func (m model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.state = stateList
 	case "ctrl+c":
 		return m, tea.Quit
+	default:
+		m.scrollKeys(msg.String())
 	}
 	return m, nil
 }
@@ -837,7 +926,7 @@ func (m *model) startDeletions(includeRemote bool) tea.Cmd {
 	sel := m.selectedBranches()
 	m.results = make([]deleteResult, len(sel))
 	m.spinnerFrame = 0
-	m.state = stateDeleting
+	m.state, m.bodyTop = stateDeleting, 0
 
 	cmds := []tea.Cmd{spinnerTickCmd()}
 	for i, b := range sel {
@@ -875,11 +964,13 @@ func (m model) updateForcePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y", "Y":
 		m.forceDeleteUnmerged()
-		m.state = stateResult
+		m.state, m.bodyTop = stateResult, 0
 	case "n", "N", "esc", "q", "enter":
-		m.state = stateResult
+		m.state, m.bodyTop = stateResult, 0
 	case "ctrl+c":
 		return m, tea.Quit
+	default:
+		m.scrollKeys(msg.String())
 	}
 	return m, nil
 }
@@ -988,51 +1079,70 @@ func carryMarks(old, fresh []branch) []branch {
 // derived from it (name-width, merge info, sort order). Callers set their own
 // cursor policy around it. This is the single refresh core shared by
 // reloadBranches and the fetch handler.
-func (m *model) applyBranches(branches []branch) {
+func (m *model) applyBranches(branches []branch, reads repoReads) {
 	m.branches = branches
 	m.recomputeNameWidth()
-	m.refreshMergeInfo()
+	m.refreshMergeInfo(reads)
 	m.sortBranches()
 }
 
 // reloadBranches refreshes the branch list from git and resets the view to the
 // top — appropriate after a mutation that may have removed the cursor's branch.
 func (m *model) reloadBranches() {
-	if branches, err := loadBranches(); err == nil {
+	if branches, reads, err := loadRepo(); err == nil {
 		m.cursor = 0
 		m.top = 0
-		m.applyBranches(branches)
+		m.applyBranches(branches, reads)
 	}
+}
+
+// hasBranch reports whether the loaded list holds a local branch of that name.
+func (m model) hasBranch(name string) bool {
+	for _, b := range m.branches {
+		if b.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // refreshMergeInfo caches the remote default branch, marks each branch whose
 // upstream is merged into it or whose tip is merged into HEAD, and measures what
-// deleting it would cost. Call after every branch (re)load.
-func (m *model) refreshMergeInfo() {
-	// localMergedSet needs nothing from the remote resolution, so let the two
-	// runs of subprocesses overlap rather than queue.
-	var headMerged map[string]bool
-	local := make(chan struct{})
-	go func() {
-		headMerged = localMergedSet()
-		close(local)
-	}()
-	defRef := remoteDefault()
-	merged := remoteMergedSet(defRef)
-	<-local
+// deleting it would cost. Call after every branch (re)load, passing the reads
+// that came back with it.
+func (m *model) refreshMergeInfo(reads repoReads) {
+	defRef := remoteDefaultFrom(reads.remotes)
 
 	m.riskBaseRef = defRef
 	if m.riskBaseRef == "" {
-		m.riskBaseRef = localDefaultBranch("")
+		// The branch list is already loaded, so this candidate check is a lookup
+		// rather than a subprocess per name.
+		m.riskBaseRef = localDefaultBranch("", m.hasBranch)
 	}
 	// The refs drive git; the short forms are what the views print.
 	m.remoteDefault = shortRef(defRef)
 	m.riskBase = shortRef(m.riskBaseRef)
 
+	// Round two. Neither query needs the other's answer, and each is a
+	// subprocess start, so they go together.
+	var merged map[string]bool
+	remote := make(chan struct{})
+	go func() {
+		merged = remoteMergedSet(defRef)
+		close(remote)
+	}()
+	// One query answers "is this branch's tip already in the base?" for the whole
+	// list, which is the answer for most branches a prune touches.
+	m.baseMerged = nil
+	if m.riskBaseRef != "" {
+		m.baseMerged = mergedSet("branch", "--merged", m.riskBaseRef)
+	}
+	<-remote
+
 	for i := range m.branches {
 		b := &m.branches[i]
 		b.remoteMerged = b.upstream != "" && merged[b.upstream]
-		b.headMerged = headMerged[b.name]
+		b.headMerged = reads.headMerged[b.name]
 		b.riskMeasured = false // the branch was just reloaded; any old count is stale
 	}
 	// Only gone branches are measured up front, because `p` consults the count to
@@ -1052,6 +1162,14 @@ func (m *model) measureRisk(want func(branch) bool) {
 	var wg sync.WaitGroup
 	for i := range m.branches {
 		if m.branches[i].riskMeasured || !want(m.branches[i]) {
+			continue
+		}
+		// A branch already contained in the base has an empty base..branch range,
+		// so `git cherry` would report nothing. Answer from the set instead of
+		// spawning the subprocess.
+		if m.baseMerged[m.branches[i].name] {
+			m.branches[i].riskCommits = 0
+			m.branches[i].riskMeasured = true
 			continue
 		}
 		wg.Add(1)
@@ -1115,6 +1233,99 @@ func (m model) View() string {
 	default:
 		return m.listView()
 	}
+}
+
+// page renders a screen as fixed header lines, a window into body, and fixed
+// footer lines. The prompt on these screens is the whole point of them, and it
+// lives in the footer: without a window, a wide selection pushes the question
+// past the last row of the terminal, where the user cannot read what they are
+// answering. Rendering only the visible rows is also what keeps a long list off
+// the cost of every frame.
+func (m model) page(header, body, footer []string) string {
+	rows := m.bodyRows(len(header), len(footer), len(body))
+	top := max(0, min(m.bodyTop, len(body)-rows))
+	end := min(top+rows, len(body))
+
+	var b strings.Builder
+	for _, l := range header {
+		b.WriteString(l + "\n")
+	}
+	for _, l := range body[top:end] {
+		b.WriteString(l + "\n")
+	}
+	if len(body) > rows {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("[%d-%d / %d]  ↑/↓ scroll · space/ctrl+d page · g/G top/bottom",
+			top+1, end, len(body))) + "\n")
+	}
+	for _, l := range footer {
+		b.WriteString(l + "\n")
+	}
+	return b.String()
+}
+
+// bodyRows is how many body lines fit between header and footer. A body that
+// does not fit gives up one more row to the position line, so that line never
+// pushes the footer off in its turn.
+func (m model) bodyRows(header, footer, body int) int {
+	rows := max(1, m.height-header-footer)
+	if body > rows {
+		rows = max(1, rows-1)
+	}
+	return rows
+}
+
+// pageParts returns the current state's screen as header, body and footer. The
+// scroll keys measure against it too, so the window and the clamp can never
+// disagree about how far down the body goes.
+func (m model) pageParts() (header, body, footer []string) {
+	switch m.state {
+	case stateConfirm:
+		return m.confirmParts()
+	case stateForcePrompt:
+		return m.forcePromptParts()
+	case stateDeleting:
+		return m.deletingParts()
+	case stateResult:
+		return m.resultParts()
+	}
+	return nil, nil, nil
+}
+
+// bodyWindow reports the visible row count and the total body length for the
+// current state.
+func (m model) bodyWindow() (rows, total int) {
+	header, body, footer := m.pageParts()
+	return m.bodyRows(len(header), len(footer), len(body)), len(body)
+}
+
+func (m *model) clampBody() {
+	rows, total := m.bodyWindow()
+	m.bodyTop = max(0, min(m.bodyTop, total-rows))
+}
+
+// scrollKeys applies the shared paging keys to a windowed screen. It reports
+// whether the key was one of them, so each screen's own keys stay in charge:
+// callers must offer their answers first.
+func (m *model) scrollKeys(s string) bool {
+	rows, total := m.bodyWindow()
+	switch s {
+	case "up", "k":
+		m.bodyTop--
+	case "down", "j":
+		m.bodyTop++
+	case "ctrl+u", "pgup":
+		m.bodyTop -= max(1, rows/2)
+	case "ctrl+d", "pgdown", " ":
+		m.bodyTop += max(1, rows/2)
+	case "g", "home":
+		m.bodyTop = 0
+	case "G", "end":
+		m.bodyTop = total
+	default:
+		return false
+	}
+	m.clampBody()
+	return true
 }
 
 func colorizeDiffLine(line string) string {
@@ -1341,6 +1552,7 @@ func (m model) helpView() string {
 		{"d, enter", "delete selected branches (local)"},
 		{"", "on confirm: y = local only · R = local + remote"},
 		{"", "(unmerged -d failures prompt to retry with -D)"},
+		{"", "long lists scroll: ↑/↓ · space/ctrl+d · g/G"},
 		{"?", "toggle this help screen"},
 		{"q, ctrl+c", "quit"},
 	})
@@ -1368,64 +1580,66 @@ func (m model) helpView() string {
 	return b.String()
 }
 
-func (m model) confirmView() string {
-	var b strings.Builder
+func (m model) confirmParts() (header, body, footer []string) {
 	sel := m.selectedBranches()
-
-	b.WriteString(headerStyle.Render("Confirm deletion"))
-	b.WriteString("\n\n")
 	flag := "-d (safe)"
 	if m.force {
 		flag = "-D (force)"
 	}
 	remoteCount := countArmedRemotes(sel)
-	b.WriteString(fmt.Sprintf("Local delete mode: %s\n", flag))
-	b.WriteString(fmt.Sprintf("Deleting %d local branch(es), %d remote branch(es).\n\n", len(sel), remoteCount))
+	header = []string{
+		headerStyle.Render("Confirm deletion"),
+		"",
+		fmt.Sprintf("Local delete mode: %s", flag),
+		fmt.Sprintf("Deleting %d local branch(es), %d remote branch(es).", len(sel), remoteCount),
+		"",
+	}
 
 	for _, br := range sel {
-		b.WriteString("  " + cursorStyle.Render("• "+br.name) + "\n")
+		body = append(body, "  "+cursorStyle.Render("• "+br.name))
 
 		date := br.committed.Format("2006-Jan-02")
 		if br.committedRel != "" {
 			date += " (" + br.committedRel + ")"
 		}
-		b.WriteString("      " + dimStyle.Render(fmt.Sprintf("%s  %s  %s", br.hash, date, truncate(br.subject, 50))) + "\n")
+		body = append(body, "      "+dimStyle.Render(fmt.Sprintf("%s  %s  %s", br.hash, date, truncate(br.subject, 50))))
 
 		switch {
 		case br.gone:
-			b.WriteString("      " + goneStyle.Render("upstream gone: "+br.upstream+" — will prune with -D (force)") + "\n")
+			body = append(body, "      "+goneStyle.Render("upstream gone: "+br.upstream+" — will prune with -D (force)"))
 		case br.upstream != "":
-			b.WriteString("      " + dimStyle.Render("upstream: "+br.upstream) + " " + m.trackStr(br) + "\n")
+			body = append(body, "      "+dimStyle.Render("upstream: "+br.upstream)+" "+m.trackStr(br))
 		default:
-			b.WriteString("      " + dimStyle.Render("no upstream") + "\n")
+			body = append(body, "      "+dimStyle.Render("no upstream"))
 		}
 
 		if br.upstream != "" && m.remoteDefault != "" {
 			if br.remoteMerged {
-				b.WriteString("      " + okStyle.Render("✓ merged into "+m.remoteDefault) + "\n")
+				body = append(body, "      "+okStyle.Render("✓ merged into "+m.remoteDefault))
 			} else {
-				b.WriteString("      " + goneStyle.Render("⚠ not merged into "+m.remoteDefault) + "\n")
+				body = append(body, "      "+goneStyle.Render("⚠ not merged into "+m.remoteDefault))
 			}
 		}
 
 		if br.deleteRemote && br.upstream != "" {
-			b.WriteString("      " + errStyle.Render(fmt.Sprintf("+ delete remote %s/%s", br.remoteName(), br.remoteBranch())) + "\n")
+			body = append(body, "      "+errStyle.Render(fmt.Sprintf("+ delete remote %s/%s", br.remoteName(), br.remoteBranch())))
 		}
 		if w := m.riskWarning(br); w != "" {
-			b.WriteString("      " + errStyle.Render(w) + "\n")
+			body = append(body, "      "+errStyle.Render(w))
 		}
-		b.WriteString("\n")
+		body = append(body, "")
 	}
 
-	b.WriteString(headerStyle.Render("Delete these branches? "))
+	prompt := headerStyle.Render("Delete these branches? ")
 	if remoteCount > 0 {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("(y = local only · R = local + remote (%d) · n/esc = cancel)", remoteCount)))
+		prompt += dimStyle.Render(fmt.Sprintf("(y = local only · R = local + remote (%d) · n/esc = cancel)", remoteCount))
 	} else {
-		b.WriteString(dimStyle.Render("(y = yes · n/esc = cancel)"))
+		prompt += dimStyle.Render("(y = yes · n/esc = cancel)")
 	}
-	b.WriteString("\n")
-	return b.String()
+	return header, body, []string{prompt}
 }
+
+func (m model) confirmView() string { return m.page(m.confirmParts()) }
 
 // riskWarning states the cost of deleting br, or "" when the delete is clean.
 // It covers every branch git's safe delete would refuse plus gone branches,
@@ -1451,91 +1665,91 @@ func (m model) riskWarning(br branch) string {
 	return "⚠ not fully merged — safe delete (-d) will fail; use force (f)"
 }
 
-func (m model) forcePromptView() string {
-	var b strings.Builder
+func (m model) forcePromptParts() (header, body, footer []string) {
 	failures := m.forceableFailures()
 
-	b.WriteString(headerStyle.Render("Force delete unmerged branches?"))
-	b.WriteString("\n\n")
-	b.WriteString(fmt.Sprintf("%d branch(es) were refused by safe delete (-d) because they are not\n", len(failures)))
-	b.WriteString("fully merged. Force deleting (-D) will ")
-	b.WriteString(errStyle.Render("permanently discard their unmerged commits"))
-	b.WriteString(".\n\n")
+	header = []string{
+		headerStyle.Render("Force delete unmerged branches?"),
+		"",
+		fmt.Sprintf("%d branch(es) were refused by safe delete (-d) because they are not", len(failures)),
+		"fully merged. Force deleting (-D) will " + errStyle.Render("permanently discard their unmerged commits") + ".",
+		"",
+	}
 
 	for _, r := range failures {
-		b.WriteString("  " + cursorStyle.Render("• "+r.br.name) + "\n")
+		body = append(body, "  "+cursorStyle.Render("• "+r.br.name))
 		// Every branch here failed -d, so its risk was measured before the delete
 		// ran: riskCommits == 0 means either nothing is missing from the base or
 		// there was no base to measure against.
 		switch {
 		case r.br.riskCommits > 0:
-			b.WriteString("      " + errStyle.Render(fmt.Sprintf("⚠ %d commit(s) not in %s will be lost", r.br.riskCommits, m.riskBase)) + "\n")
+			body = append(body, "      "+errStyle.Render(fmt.Sprintf("⚠ %d commit(s) not in %s will be lost", r.br.riskCommits, m.riskBase)))
 		case m.riskBase == "":
-			b.WriteString("      " + errStyle.Render("⚠ no base branch to compare against — unmerged commits may be lost") + "\n")
+			body = append(body, "      "+errStyle.Render("⚠ no base branch to compare against — unmerged commits may be lost"))
 		default:
-			b.WriteString("      " + dimStyle.Render("no commits missing from "+m.riskBase) + "\n")
+			body = append(body, "      "+dimStyle.Render("no commits missing from "+m.riskBase))
 		}
 		if r.remoteSkipped {
-			b.WriteString("      " + errStyle.Render(fmt.Sprintf("+ remote %s/%s will be deleted once the branch is gone", r.br.remoteName(), r.br.remoteBranch())) + "\n")
+			body = append(body, "      "+errStyle.Render(fmt.Sprintf("+ remote %s/%s will be deleted once the branch is gone", r.br.remoteName(), r.br.remoteBranch())))
 		}
 	}
 
-	b.WriteString("\n")
-	b.WriteString(headerStyle.Render("Force delete (-D) these branches? "))
-	b.WriteString(dimStyle.Render("(y = yes, discard · n/esc = keep them)"))
-	b.WriteString("\n")
-	return b.String()
+	footer = []string{
+		"",
+		headerStyle.Render("Force delete (-D) these branches? ") + dimStyle.Render("(y = yes, discard · n/esc = keep them)"),
+	}
+	return header, body, footer
 }
 
-// writeResultLines renders one completed deletion result (local, then remote if
-// tried) into b. Shared by the results screen and the live deleting screen.
-func writeResultLines(b *strings.Builder, r deleteResult) {
+func (m model) forcePromptView() string { return m.page(m.forcePromptParts()) }
+
+// appendResultLines adds one completed deletion result (local, then remote if
+// tried) to dst. Shared by the results screen and the live deleting screen.
+func appendResultLines(dst []string, r deleteResult) []string {
 	if r.localOK {
-		b.WriteString(okStyle.Render("  ✓ ") + "deleted local " + r.br.name + "\n")
+		dst = append(dst, okStyle.Render("  ✓ ")+"deleted local "+r.br.name)
 	} else {
-		b.WriteString(errStyle.Render("  ✗ ") + "local " + r.br.name + ": " + r.localErr + "\n")
+		dst = append(dst, errStyle.Render("  ✗ ")+"local "+r.br.name+": "+r.localErr)
 	}
 	switch {
 	case r.remoteSkipped:
 		// Say why the armed remote survived, or it reads as a silent failure.
-		b.WriteString(errStyle.Render("  ! ") + "kept remote " + r.br.remoteName() + "/" + r.br.remoteBranch() + ": local delete failed\n")
+		dst = append(dst, errStyle.Render("  ! ")+"kept remote "+r.br.remoteName()+"/"+r.br.remoteBranch()+": local delete failed")
 	case r.remoteTried && r.remoteOK:
-		b.WriteString(okStyle.Render("  ✓ ") + "deleted remote " + r.br.name + "\n")
+		dst = append(dst, okStyle.Render("  ✓ ")+"deleted remote "+r.br.name)
 	case r.remoteTried:
-		b.WriteString(errStyle.Render("  ✗ ") + "remote " + r.br.name + ": " + r.remoteErr + "\n")
+		dst = append(dst, errStyle.Render("  ✗ ")+"remote "+r.br.name+": "+r.remoteErr)
 	}
+	return dst
 }
 
-func (m model) deletingView() string {
-	var b strings.Builder
+func (m model) deletingParts() (header, body, footer []string) {
 	spin := spinnerFrames[m.spinnerFrame%len(spinnerFrames)]
-	b.WriteString(headerStyle.Render(fmt.Sprintf("%s Deleting… (%d/%d)", spin, m.deletesDone(), len(m.results))))
-	b.WriteString("\n\n")
+	header = []string{
+		headerStyle.Render(fmt.Sprintf("%s Deleting… (%d/%d)", spin, m.deletesDone(), len(m.results))),
+		"",
+	}
 	for _, r := range m.results {
 		if r.done {
-			writeResultLines(&b, r)
+			body = appendResultLines(body, r)
 		} else {
-			b.WriteString(dimStyle.Render("  "+spin+" deleting "+r.br.name+"…") + "\n")
+			body = append(body, dimStyle.Render("  "+spin+" deleting "+r.br.name+"…"))
 		}
 	}
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("working — ctrl+c to abort"))
-	b.WriteString("\n")
-	return b.String()
+	return header, body, []string{"", dimStyle.Render("working — ctrl+c to abort")}
 }
 
-func (m model) resultView() string {
-	var b strings.Builder
-	b.WriteString(headerStyle.Render("Results"))
-	b.WriteString("\n\n")
+func (m model) deletingView() string { return m.page(m.deletingParts()) }
+
+func (m model) resultParts() (header, body, footer []string) {
+	header = []string{headerStyle.Render("Results"), ""}
 	for _, r := range m.results {
-		writeResultLines(&b, r)
+		body = appendResultLines(body, r)
 	}
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("press q/enter to quit"))
-	b.WriteString("\n")
-	return b.String()
+	return header, body, []string{"", dimStyle.Render("press q/enter to quit")}
 }
+
+func (m model) resultView() string { return m.page(m.resultParts()) }
 
 // versionString reports the build's commit and date using Go's automatic VCS
 // stamping (populated when built with `go build` inside the repo). Fields fall

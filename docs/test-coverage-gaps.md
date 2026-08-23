@@ -208,7 +208,8 @@ All three tiers are complete (2026-08-17): **14 tests added, 43 total**, passing
 - Tier 3 pins five everyday operations and corrected one more prediction.
 - A `/simplify` pass then found **two further live instances of the tag-shadowing bug** that
   Tier 1 had missed (`localDefaultBranch` and `push --delete`), removed the `qualifyRef`
-  probe, and brought startup back from 11 git subprocesses to 7 — the pre-change baseline.
+  probe, and brought startup back from 11 git subprocesses to 7 — the pre-change baseline. It is
+6 now, in two concurrent rounds rather than six serial ones (see item 18 in `improvements.md`).
 
 Fixtures compose rather than duplicate: `initRepo` (bare init + identity) →
 `setupLocalRepo` (branch shapes) → `setupRepo` (+ `addOrigin` + a tracking branch), with
