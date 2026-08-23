@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -174,7 +176,72 @@ var (
 
 // ---- git I/O ----
 
+// Concurrency caps. Local git work is subprocess-bound — roughly 6ms of spawn
+// cost each — so running it a few at a time is what makes a repo full of gone
+// branches load quickly. Remote work is not: every push or fetch opens its own
+// connection, and a prune of a hundred armed branches would open a hundred at
+// once, which remotes throttle or refuse. The two are capped separately so a
+// wide local fan-out never widens the network one.
+const (
+	maxLocalGit   = 8
+	maxRemotePush = 3
+)
+
+var (
+	localSlots  = make(chan struct{}, maxLocalGit)
+	remoteSlots = make(chan struct{}, maxRemotePush)
+)
+
+// networkBound reports whether a git invocation opens a connection to a remote.
+// It is what picks the cap, so a new network subcommand belongs here rather than
+// at its call site.
+func networkBound(args []string) bool {
+	return len(args) > 0 && (args[0] == "push" || args[0] == "fetch")
+}
+
+// gauge records the highest number of concurrent holders it has seen. It sits on
+// the subprocesses rather than on the slots, so a test can tell a cap that works
+// from one that was removed — instrumenting the cap would stop reporting along
+// with it.
+type gauge struct{ inFlight, peak atomic.Int64 }
+
+func (g *gauge) enter() {
+	n := g.inFlight.Add(1)
+	for {
+		peak := g.peak.Load()
+		if n <= peak || g.peak.CompareAndSwap(peak, n) {
+			return
+		}
+	}
+}
+
+func (g *gauge) leave() { g.inFlight.Add(-1) }
+
+// gitProcs counts every git subprocess; netProcs counts the ones that talk to a
+// remote, which is what a remote host actually feels.
+var gitProcs, netProcs gauge
+
+// runGit is the single door every git invocation passes through, which is what
+// makes it the place to bound them: a cap at the call sites would only hold for
+// the callers that remembered to ask.
 func runGit(args ...string) (string, error) {
+	net := networkBound(args)
+	slots := localSlots
+	if net {
+		slots = remoteSlots
+	}
+	slots <- struct{}{}
+	defer func() { <-slots }()
+
+	// Counted after the slot is held, so the gauges measure what is running
+	// rather than what is queued.
+	gitProcs.enter()
+	defer gitProcs.leave()
+	if net {
+		netProcs.enter()
+		defer netProcs.leave()
+	}
+
 	cmd := exec.Command("git", args...)
 	// Pin the locale: deleteBranch classifies failures by matching git's own
 	// error text, which gettext would otherwise translate. Everything else we
@@ -857,8 +924,8 @@ func (b branch) deleteFlag(force bool) string {
 }
 
 // deleteBranch runs one branch's local delete and, when wantRemote is set, its
-// remote-branch push --delete. It is the single worker shared by the synchronous
-// performDeletions path and the asynchronous deleteBranchCmd path.
+// remote-branch push --delete. It is the worker deleteBranchCmd runs off the
+// update loop, one cmd per branch.
 func deleteBranch(b branch, flag string, wantRemote bool) deleteResult {
 	res := deleteResult{br: b, done: true}
 	if _, err := runGit("branch", flag, b.name); err != nil {
@@ -896,19 +963,6 @@ func pushRemoteDelete(res *deleteResult) {
 	} else {
 		res.remoteOK = true
 	}
-}
-
-// performDeletions deletes the selected branches synchronously. The interactive
-// UI uses the async startDeletions path instead; this remains for tests and as
-// the straightforward equivalent.
-func (m *model) performDeletions() {
-	m.measureSelectedRisk()
-	m.results = nil
-	for _, b := range m.selectedBranches() {
-		wantRemote := b.deleteRemote && b.upstream != ""
-		m.results = append(m.results, deleteBranch(b, b.deleteFlag(m.force), wantRemote))
-	}
-	m.reloadBranches()
 }
 
 // carryMarks copies the user's pending selections from old onto a freshly loaded
@@ -955,9 +1009,17 @@ func (m *model) reloadBranches() {
 // upstream is merged into it or whose tip is merged into HEAD, and measures what
 // deleting it would cost. Call after every branch (re)load.
 func (m *model) refreshMergeInfo() {
+	// localMergedSet needs nothing from the remote resolution, so let the two
+	// runs of subprocesses overlap rather than queue.
+	var headMerged map[string]bool
+	local := make(chan struct{})
+	go func() {
+		headMerged = localMergedSet()
+		close(local)
+	}()
 	defRef := remoteDefault()
 	merged := remoteMergedSet(defRef)
-	headMerged := localMergedSet()
+	<-local
 
 	m.riskBaseRef = defRef
 	if m.riskBaseRef == "" {
@@ -972,35 +1034,42 @@ func (m *model) refreshMergeInfo() {
 		b.remoteMerged = b.upstream != "" && merged[b.upstream]
 		b.headMerged = headMerged[b.name]
 		b.riskMeasured = false // the branch was just reloaded; any old count is stale
-		// Only gone branches are measured up front, because `p` consults the count
-		// to decide what it may auto-select. The rest wait for measureSelectedRisk:
-		// riskCommitCount is a subprocess per branch, and running it for every
-		// unmergeable branch here cost a second of startup on a repo with dozens.
-		if b.gone {
-			m.measureRisk(b)
-		}
 	}
+	// Only gone branches are measured up front, because `p` consults the count to
+	// decide what it may auto-select. The rest wait for measureSelectedRisk:
+	// riskCommitCount is a subprocess per branch, and measuring every unmergeable
+	// branch here would put a network-free repo's whole branch list on the clock.
+	m.measureRisk(func(b branch) bool { return b.gone })
 }
 
-// measureRisk fills in b's cost-of-deletion count, once per (re)load.
-func (m *model) measureRisk(b *branch) {
-	if b.riskMeasured {
-		return
+// measureRisk fills in the cost-of-deletion count for every not-yet-measured
+// branch that want accepts. The counts are independent `git cherry` subprocesses
+// whose cost is dominated by process spawn, so they run concurrently: measured
+// one at a time, a repo with a hundred gone branches spent 1.1s here on every
+// load, fetch and prune.
+func (m *model) measureRisk(want func(branch) bool) {
+	base := m.riskBaseRef // read once: the goroutines must not touch the model
+	var wg sync.WaitGroup
+	for i := range m.branches {
+		if m.branches[i].riskMeasured || !want(m.branches[i]) {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Each goroutine owns one slice element, so no two write the same branch.
+			m.branches[i].riskCommits = riskCommitCount(m.branches[i].name, base)
+			m.branches[i].riskMeasured = true
+		}()
 	}
-	b.riskCommits = riskCommitCount(b.name, m.riskBaseRef)
-	b.riskMeasured = true
+	wg.Wait()
 }
 
 // measureSelectedRisk measures what deleting each selected branch would cost.
 // Call before any view that reports the cost: only branches a safe delete would
 // refuse are measured, since those are the ones deleted with -D.
 func (m *model) measureSelectedRisk() {
-	for i := range m.branches {
-		b := &m.branches[i]
-		if b.selected && (b.gone || !b.safeDeletable()) {
-			m.measureRisk(b)
-		}
-	}
+	m.measureRisk(func(b branch) bool { return b.selected && (b.gone || !b.safeDeletable()) })
 }
 
 // forceDeleteUnmerged re-runs the deletions that a safe (-d) delete refused,
