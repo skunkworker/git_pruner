@@ -100,22 +100,20 @@ func wantState(t *testing.T, m model, want viewState, why string) {
 // remoteHasBranch reports whether origin still has the named branch.
 func remoteHasBranch(t *testing.T, dir, name string) bool {
 	t.Helper()
-	cmd := exec.Command("git", "ls-remote", "--heads", "origin", name)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("ls-remote: %v\n%s", err, out)
-	}
-	return strings.TrimSpace(string(out)) != ""
+	return git(t, dir, "ls-remote", "--heads", "origin", name) != ""
 }
 
-func git(t *testing.T, dir string, args ...string) {
+// git runs a git command in dir, failing the test on error, and returns its
+// trimmed output for the callers that read it.
+func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
+	return strings.TrimSpace(string(out))
 }
 
 // initRepo creates an empty repository on the named initial branch with a commit
@@ -945,8 +943,7 @@ func TestTrackColumnAlignment(t *testing.T) {
 	}
 	want := -1
 	for _, br := range rows {
-		m.branches = []branch{br}
-		plain := stripANSI(m.renderRow(0, 10))
+		plain := stripANSI(m.renderRow(br, 10, false))
 		at := strings.Index(plain, "0001-Jan-01") // the column right after track
 		if at < 0 {
 			t.Fatalf("date column missing for %q: %q", br.name, plain)
@@ -2389,5 +2386,219 @@ func TestShortBodyRendersWhole(t *testing.T) {
 		if !strings.Contains(out, "feature/"+strconv.Itoa(i)) {
 			t.Fatalf("every result must be shown:\n%s", out)
 		}
+	}
+}
+
+// ---- branch switching (b) and name filtering (/) ----
+
+// special builds a non-rune KeyMsg (esc, enter, backspace) for the handlers.
+func special(k tea.KeyType) tea.KeyMsg { return tea.KeyMsg{Type: k} }
+
+// press feeds keys through Update — the state machine's own dispatch — and
+// returns the resulting model. Any cmds the keys produce are dropped.
+func press(t *testing.T, m model, keys ...tea.KeyMsg) model {
+	t.Helper()
+	for _, k := range keys {
+		nm, _ := m.Update(k)
+		m = nm.(model)
+	}
+	return m
+}
+
+// cursorTo puts the cursor on the named branch's view row, failing if the
+// branch is not visible.
+func cursorTo(t *testing.T, m *model, name string) {
+	t.Helper()
+	m.focusBranch(name)
+	if b := m.cur(); b == nil || b.name != name {
+		t.Fatalf("branch %q not visible", name)
+	}
+}
+
+// doSwitch presses b and, when a switch starts, drives its async cmd to
+// completion the way the tea runtime would.
+func doSwitch(t *testing.T, m model) model {
+	t.Helper()
+	nm, cmd := m.Update(key("b"))
+	m = nm.(model)
+	if cmd == nil {
+		return m // guarded no-op: nothing was started
+	}
+	nm, _ = m.Update(cmd())
+	return nm.(model)
+}
+
+// currentBranch reports the checked-out branch of dir.
+func currentBranch(t *testing.T, dir string) string {
+	t.Helper()
+	return git(t, dir, "symbolic-ref", "--short", "HEAD")
+}
+
+func TestSwitchBranch(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Marks must survive the switch — except on the branch that becomes
+	// current, which the list refuses to operate on.
+	find(m.branches, "feature/tracked").selected = true
+	find(m.branches, "feature/merged").selected = true
+
+	cursorTo(t, &m, "feature/merged")
+	m = doSwitch(t, m)
+
+	if got := currentBranch(t, repo); got != "feature/merged" {
+		t.Fatalf("current branch is %q, want feature/merged", got)
+	}
+	if b := find(m.branches, "feature/merged"); !b.isCurrent || b.selected {
+		t.Fatalf("switched-to branch must be current and unmarked: %+v", b)
+	}
+	if !find(m.branches, "feature/tracked").selected {
+		t.Fatal("marks on other branches must survive the switch")
+	}
+	if b := m.cur(); b == nil || b.name != "feature/merged" {
+		t.Fatalf("cursor must follow the switched branch, is on %+v", b)
+	}
+	if m.status == "" || m.err != "" {
+		t.Fatalf("want a status and no error, got status=%q err=%q", m.status, m.err)
+	}
+}
+
+func TestSwitchBranchRefusedKeepsState(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// feature/unmerged committed a file named b; an untracked b on main makes
+	// git refuse the switch rather than overwrite it.
+	if err := os.WriteFile(filepath.Join(repo, "b"), []byte("local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cursorTo(t, &m, "feature/unmerged")
+	m = doSwitch(t, m)
+
+	if got := currentBranch(t, repo); got != "main" {
+		t.Fatalf("a refused switch must keep main current, got %q", got)
+	}
+	if m.err == "" {
+		t.Fatal("a refused switch must surface git's reason")
+	}
+}
+
+func TestSwitchOnCurrentBranchIsNoop(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursorTo(t, &m, "main")
+	m = doSwitch(t, m)
+	if m.err != "" || m.status != "" {
+		t.Fatalf("b on the current branch must do nothing, got status=%q err=%q", m.status, m.err)
+	}
+	if got := currentBranch(t, repo); got != "main" {
+		t.Fatalf("current branch moved to %q", got)
+	}
+}
+
+func TestFilterNarrowsAndClears(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m = press(t, m, key("/"))
+	if m.state != stateFilter {
+		t.Fatal("/ must start filter input")
+	}
+	m = press(t, m, key("feat"))
+	if got := len(m.viewIdx()); got != 3 {
+		t.Fatalf("filter feat: %d rows visible, want 3", got)
+	}
+	if out := stripANSI(m.listView()); !strings.Contains(out, "filter: feat") {
+		t.Fatalf("header must show the filter:\n%s", out)
+	}
+
+	// While typing, action keys are text: q filters, it must not quit.
+	nm, cmd := m.Update(key("q"))
+	m = nm.(model)
+	if cmd != nil || m.filter != "featq" {
+		t.Fatalf("q while typing must extend the filter, got %q", m.filter)
+	}
+	m = press(t, m, special(tea.KeyBackspace))
+	if m.filter != "feat" {
+		t.Fatalf("backspace must trim the filter, got %q", m.filter)
+	}
+
+	// enter keeps the filter; esc from the list then clears it.
+	m = press(t, m, special(tea.KeyEnter))
+	if m.state != stateList || m.filter != "feat" {
+		t.Fatalf("enter must keep the filter, got state=%v filter=%q", m.state, m.filter)
+	}
+	m = press(t, m, special(tea.KeyEsc))
+	if m.filter != "" || len(m.viewIdx()) != 4 {
+		t.Fatalf("esc must clear the filter, got %q (%d rows)", m.filter, len(m.viewIdx()))
+	}
+}
+
+func TestFilterSelectAllMarksOnlyVisible(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m = press(t, m, key("/"), key("unmerged"), special(tea.KeyEnter), key("a"), special(tea.KeyEsc))
+
+	for _, b := range m.branches {
+		want := b.name == "feature/unmerged"
+		if b.selected != want {
+			t.Fatalf("a under a filter must mark only visible branches: %s selected=%v", b.name, b.selected)
+		}
+	}
+}
+
+func TestFilterNoMatches(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m = press(t, m, key("/"), key("zzz"))
+	if out := stripANSI(m.listView()); !strings.Contains(out, "no branches match filter") {
+		t.Fatalf("empty match must say so:\n%s", out)
+	}
+	// No visible row: cursor keys and actions must not panic or act.
+	m = press(t, m, special(tea.KeyEnter), key(" "), key("b"), key("G"))
+	if b := m.cur(); b != nil {
+		t.Fatalf("no branch should be under the cursor, got %+v", b)
+	}
+	if got := currentBranch(t, repo); got != "main" {
+		t.Fatalf("b with no row must not switch, got %q", got)
+	}
+}
+
+func TestFilterCursorClamps(t *testing.T) {
+	repo := setupRepo(t)
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m = press(t, m, key("G"), key("/"), key("main"))
+	if len(m.viewIdx()) != 1 || m.cursor != 0 {
+		t.Fatalf("filter must clamp the cursor into view: cursor=%d rows=%d", m.cursor, len(m.viewIdx()))
 	}
 }

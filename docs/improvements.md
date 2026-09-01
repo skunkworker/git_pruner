@@ -248,8 +248,14 @@ Set `GIT_TERMINAL_PROMPT=0` and attach a `context.WithTimeout` so it fails fast 
 
 ### Tier 3 — features for the tool's actual job
 
-**9. `/` incremental filter.** With dozens of branches there is currently no way to narrow the
-list — the single biggest UX gap for the repos this tool exists to clean up.
+**9. `/` incremental filter.** ✅ Done (2026-08-31). Case-insensitive substring filter over
+branch names; `enter` keeps it, `esc` clears it, and `a` selects only the listed rows. The
+cursor and scroll offsets are positions in the filtered view (`viewIdx`); marks stay on the
+branch structs, so hidden rows keep theirs.
+
+**9b. `b` branch switch.** ✅ Done (2026-08-31). `git switch` on the cursor row — it resolves
+branch names only, so the tag-shadowing rule holds without qualification. Part of a deliberate
+shift toward a general interactive branch tool, not just pruning.
 
 **10. Bulk-select predicates** (merged, older than N days). "Select everything merged and older
 than 90 days" is the canonical prune workflow and currently has to be done by hand.
@@ -263,6 +269,35 @@ naturally with finding 1.
 **12. Split `main.go`** (~1,300 lines) into `git.go` / `model.go` / `view.go`.
 
 **13. Make the Makefile's `BINDIR` overridable** — it hardcodes `$HOME/shared/bin`.
+
+### Reviewed and deferred (2026-08-31 /simplify pass)
+
+Two efficiency findings from the four-agent review of the `b` switch and `/` filter change.
+Both were skipped deliberately: each trades an unmeasurable speed gain for a new way to show
+stale data. Recorded here so the analysis is not redone from scratch.
+
+**D1. Light reload after a branch switch.** A `b` press costs 5 fixed git calls plus one
+`git cherry` per gone branch (~100 calls, ~100 ms on the 100-gone-branch repo) — all in the
+background since the switch runs as a `tea.Cmd`. A checkout moves HEAD only, so
+`remoteMerged`, `riskCommits`, the risk base and `m.baseMerged` are provably unchanged; a
+light path would run only `loadBranches()` + `localMergedSet()` (2 calls) and carry the rest
+across by name, refreshing just `isCurrent` and `headMerged`. **Why deferred:** the carried
+field list is an unchecked claim ("all fields a checkout cannot change"); anyone extending
+`refreshMergeInfo` must remember to update it, or `b` becomes the one path that shows stale
+data. The full reload is right by construction. **If ever done:** pin the carried fields with
+a test that compares the light path against a fresh full reload on the same repo. This is the
+only deferred item worth revisiting, and only if a real repo shows the background reload
+contending with something.
+
+**D2. `viewIdx` allocation and lowercase caching.** `viewIdx` rebuilds its `[]int` and
+lowercases every name on each call, two to four times per keystroke; at 200 branches that is
+~1.6 KB and 20–40 µs per build — about 100× below the program's smallest felt cost (a 6 ms
+subprocess spawn). The proposed fix (`visibleCount()`/`visibleAt(p)` helpers, cached
+`lowerName` per branch, cached lowered filter) needs three predicate copies kept identical
+plus two cache-refill rules; missing a refill on a future load path makes the filter silently
+drop rows. **Why deferred:** a stale cache is a bug class, a microsecond is not. A risk-free
+middle option — sharing one `viewIdx()` result within a call chain — was judged not worth the
+churn either.
 
 ---
 

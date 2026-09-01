@@ -103,6 +103,7 @@ const (
 	stateResult
 	stateHelp
 	stateDiff
+	stateFilter // the list, with the filter line capturing keystrokes
 )
 
 type deleteResult struct {
@@ -130,6 +131,8 @@ type model struct {
 	force     bool
 	nameW     int // cached branch-name column width (see recomputeNameWidth)
 
+	filter string // active branch-name filter; "" shows every branch
+
 	state   viewState
 	results []deleteResult
 
@@ -154,6 +157,7 @@ type model struct {
 	err           string
 	status        string // transient info message (e.g. fetch results)
 	fetching      bool   // a background fetch --all --prune is in flight
+	switching     bool   // a background git switch is in flight
 }
 
 // ---- styles ----
@@ -544,6 +548,30 @@ func fetchPruneCmd() tea.Cmd {
 	}
 }
 
+// switchDoneMsg reports completion of an async `git switch`, carrying the
+// reloaded repo so the reads run off the update loop too.
+type switchDoneMsg struct {
+	name     string
+	err      error // the switch itself failed; the repo is untouched
+	branches []branch
+	reads    repoReads
+	loadErr  error
+}
+
+// switchCmd checks out the named branch and reloads the repo, off the update
+// loop like every other mutation (see fetchPruneCmd). `git switch` resolves
+// branch names only, so a same-named tag cannot shadow it (see branchRef).
+func switchCmd(name string) tea.Cmd {
+	return func() tea.Msg {
+		msg := switchDoneMsg{name: name}
+		if _, msg.err = runGit("switch", name); msg.err != nil {
+			return msg
+		}
+		msg.branches, msg.reads, msg.loadErr = loadRepo()
+		return msg
+	}
+}
+
 // branchDeletedMsg reports the outcome of one branch's async deletion; idx is
 // its position in m.results.
 type branchDeletedMsg struct {
@@ -611,8 +639,8 @@ func initialModel() (model, error) {
 
 func (m *model) sortBranches() {
 	current := ""
-	if m.cursor < len(m.branches) {
-		current = m.branches[m.cursor].name
+	if b := m.cur(); b != nil {
+		current = b.name
 	}
 	less := func(i, j int) bool {
 		a, b := m.branches[i], m.branches[j]
@@ -631,17 +659,25 @@ func (m *model) sortBranches() {
 		return r
 	}
 	sort.SliceStable(m.branches, less)
-	for i, b := range m.branches {
-		if b.name == current {
-			m.cursor = i
-			break
-		}
-	}
+	m.focusBranch(current)
 	m.clampCursor()
 }
 
+// focusBranch puts the cursor on the named branch's view row. A filtered-out
+// or unknown name leaves the cursor where it is. The cursor is a view
+// position, not a branch index — this is the one place that mapping is done.
+func (m *model) focusBranch(name string) {
+	for p, i := range m.viewIdx() {
+		if m.branches[i].name == name {
+			m.cursor = p
+			m.adjustScroll()
+			return
+		}
+	}
+}
+
 func (m *model) clampCursor() {
-	m.cursor = max(0, min(m.cursor, len(m.branches)-1))
+	m.cursor = max(0, min(m.cursor, len(m.viewIdx())-1))
 	m.adjustScroll()
 }
 
@@ -649,7 +685,7 @@ func (m *model) clampCursor() {
 // scrollable view is active; other states ignore the wheel.
 func (m *model) scroll(delta int) {
 	switch m.state {
-	case stateList:
+	case stateList, stateFilter:
 		m.cursor += delta
 		m.clampCursor()
 	case stateDiff:
@@ -676,9 +712,23 @@ func (m *model) adjustScroll() {
 	m.top = max(0, m.top)
 }
 
+// viewIdx returns the indices of the branches the list shows, in display
+// order. The cursor and scroll offsets are positions in this view, not in
+// m.branches: marks live on the branches, so hiding a row must not move them.
+func (m model) viewIdx() []int {
+	idx := make([]int, 0, len(m.branches))
+	f := strings.ToLower(m.filter)
+	for i, b := range m.branches {
+		if f == "" || strings.Contains(strings.ToLower(b.name), f) {
+			idx = append(idx, i)
+		}
+	}
+	return idx
+}
+
 func (m *model) cur() *branch {
-	if m.cursor >= 0 && m.cursor < len(m.branches) {
-		return &m.branches[m.cursor]
+	if idx := m.viewIdx(); m.cursor >= 0 && m.cursor < len(idx) {
+		return &m.branches[idx[m.cursor]]
 	}
 	return nil
 }
@@ -740,6 +790,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				gone-risky, gone, risky, m.riskBase)
 		}
 		return m, nil
+	case switchDoneMsg:
+		m.switching = false
+		if msg.err != nil {
+			// A refused switch (dirty worktree, held by another worktree)
+			// leaves the repo untouched; surface git's reason and stay put.
+			m.err = msg.err.Error()
+			m.status = ""
+			return m, nil
+		}
+		m.err = ""
+		m.status = "switched to " + msg.name
+		if msg.loadErr == nil {
+			// A switch deletes nothing, so pending marks survive it; carryMarks
+			// drops the ones now on the current branch.
+			m.applyBranches(carryMarks(m.branches, msg.branches), msg.reads)
+		}
+		m.focusBranch(msg.name)
+		return m, nil
 	case branchDeletedMsg:
 		if msg.idx >= 0 && msg.idx < len(m.results) {
 			m.results[msg.idx] = msg.res
@@ -774,6 +842,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.state {
 		case stateList:
 			return m.updateList(msg)
+		case stateFilter:
+			return m.updateFilter(msg)
 		case stateConfirm:
 			return m.updateConfirm(msg)
 		case stateForcePrompt:
@@ -802,6 +872,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateFilter handles keys in stateFilter, where the filter line captures
+// input: plain letters (q, j, a, …) type into the filter instead of firing
+// their list actions.
+func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "enter":
+		m.state = stateList
+	case "esc":
+		m.filter = ""
+		m.state = stateList
+	case "backspace":
+		if r := []rune(m.filter); len(r) > 0 {
+			m.filter = string(r[:len(r)-1])
+		}
+	default:
+		if msg.Type == tea.KeyRunes {
+			m.filter += string(msg.Runes)
+			m.cursor = 0
+		}
+	}
+	m.clampCursor()
+	return m, nil
+}
+
 func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
@@ -816,7 +912,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor = 0
 		m.clampCursor()
 	case "G", "end":
-		m.cursor = len(m.branches) - 1
+		m.cursor = len(m.branches) // clampCursor lands it on the last visible row
 		m.clampCursor()
 	case " ":
 		if b := m.cur(); b != nil && !b.isCurrent {
@@ -826,8 +922,16 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if b := m.cur(); b != nil && b.upstream != "" && !b.isCurrent {
 			b.deleteRemote = !b.deleteRemote
 		}
+	case "/":
+		m.state = stateFilter
+	case "esc":
+		// n already disarms everything; esc only lifts the filter.
+		m.filter = ""
+		m.clampCursor()
 	case "a":
-		for i := range m.branches {
+		// Select what the list shows: with a filter active, a marks only the
+		// matching branches, which is what makes filter-then-select useful.
+		for _, i := range m.viewIdx() {
 			if !m.branches[i].isCurrent {
 				m.branches[i].selected = true
 			}
@@ -869,6 +973,13 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.diffTop = 0
 			m.state = stateDiff
+		}
+	case "b":
+		if b := m.cur(); b != nil && !b.isCurrent && !m.switching && !m.fetching {
+			m.switching = true
+			m.err = ""
+			m.status = "switching to " + b.name + "…"
+			return m, switchCmd(b.name)
 		}
 	case "?":
 		m.state = stateHelp
@@ -1068,8 +1179,11 @@ func carryMarks(old, fresh []branch) []branch {
 	}
 	for i := range fresh {
 		if p, ok := prev[fresh[i].name]; ok {
-			fresh[i].selected = p.selected
-			fresh[i].deleteRemote = p.deleteRemote && !fresh[i].gone
+			// Marks never land on the current branch: it cannot be deleted, so
+			// a carried mark would arm an operation the list refuses to offer
+			// (relevant after a switch, or when HEAD moved outside the TUI).
+			fresh[i].selected = p.selected && !fresh[i].isCurrent
+			fresh[i].deleteRemote = p.deleteRemote && !fresh[i].gone && !fresh[i].isCurrent
 		}
 	}
 	return fresh
@@ -1398,26 +1512,43 @@ func (m model) listView() string {
 	if m.force {
 		forceLabel = "FORCE (-D)"
 	}
+	idx := m.viewIdx()
 	header := fmt.Sprintf("git_pruner — %d branches   sort: %s %s   delete mode: %s",
 		len(m.branches), m.field, dir, forceLabel)
 	b.WriteString(headerStyle.Render(header))
+	if m.filter != "" || m.state == stateFilter {
+		f := m.filter
+		if m.state == stateFilter {
+			f += "▌"
+		}
+		b.WriteString(selStyle.Render(fmt.Sprintf("   filter: %s (%d/%d)", f, len(idx), len(m.branches))))
+	}
 	b.WriteString("\n\n")
 
-	if len(m.branches) == 0 {
+	switch {
+	case len(m.branches) == 0:
 		b.WriteString(dimStyle.Render("no local branches found"))
+		b.WriteString("\n")
+	case len(idx) == 0:
+		b.WriteString(dimStyle.Render("no branches match filter"))
 		b.WriteString("\n")
 	}
 
 	nameW := m.nameW
 	vis := m.visibleRows()
-	end := min(m.top+vis, len(m.branches))
-	for i := m.top; i < end; i++ {
-		b.WriteString(m.renderRow(i, nameW))
+	end := min(m.top+vis, len(idx))
+	for p := m.top; p < end; p++ {
+		b.WriteString(m.renderRow(m.branches[idx[p]], nameW, p == m.cursor))
 		b.WriteString("\n")
 	}
 
 	b.WriteString("\n")
-	help := "↑/↓ move · space select · a/n all/none · r remote · v view · p prune · s sort · o order · f force · d delete · ? help · q quit"
+	var help string
+	if m.state == stateFilter {
+		help = "type to filter · enter keep · esc clear · backspace edit"
+	} else {
+		help = "↑/↓ move · space select · a/n all/none · b switch · / filter · r remote · v view · p prune · s sort · o order · f force · d delete · ? help · q quit"
+	}
 	b.WriteString(dimStyle.Render(help))
 	if m.status != "" {
 		b.WriteString("\n")
@@ -1430,11 +1561,9 @@ func (m model) listView() string {
 	return b.String()
 }
 
-func (m model) renderRow(i, nameW int) string {
-	br := m.branches[i]
-
+func (m model) renderRow(br branch, nameW int, isCursor bool) string {
 	cursor := "  "
-	if i == m.cursor {
+	if isCursor {
 		cursor = cursorStyle.Render("> ")
 	}
 	sel := "[ ]"
@@ -1454,7 +1583,7 @@ func (m model) renderRow(i, nameW int) string {
 
 	var nameRendered string
 	switch {
-	case i == m.cursor:
+	case isCursor:
 		nameRendered = cursorStyle.Render(name)
 	case br.isCurrent:
 		nameRendered = currentStyle.Render(name)
@@ -1542,7 +1671,9 @@ func (m model) helpView() string {
 		{"↑/↓, j/k", "move cursor"},
 		{"g/G, home/end", "jump to first/last"},
 		{"space", "select / deselect branch"},
-		{"a / n", "select all / none"},
+		{"a / n", "select all listed / none"},
+		{"b", "switch to the branch under the cursor"},
+		{"/", "filter by name (enter keep · esc clear)"},
 		{"r", "toggle delete of upstream remote branch"},
 		{"v", "view branch diff (green add / red remove)"},
 		{"p", "fetch --all --prune & select safe gone branches"},

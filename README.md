@@ -46,7 +46,9 @@ git_pruner version     # also --version, -v
 | `↑`/`k`, `↓`/`j` | Move cursor                                                 |
 | `g` / `G`      | Jump to top / bottom                                          |
 | `space`        | Toggle selection (the current branch cannot be selected)     |
-| `a` / `n`      | Select all / clear selection                                 |
+| `a` / `n`      | Select all listed branches / clear selection                 |
+| `b`            | Switch to the branch under the cursor (`git switch`)          |
+| `/`            | Filter branches by name; `enter` keeps it, `esc` clears it    |
 | `r`            | Toggle "also delete remote" for the row (needs an upstream)   |
 | `v`            | View the branch's diff (green additions / red removals)       |
 | `p`            | Fetch `--all --prune`, then select gone branches that hold no unique work |
