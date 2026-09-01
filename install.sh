@@ -17,8 +17,9 @@ Options:
                  directory.
   -h, --help     Show this help.
 
-Without --bindir, the first usable of ~/.local/bin or ~/bin wins, falling back
-to /usr/local/bin — which needs sudo on most systems.
+Without --bindir, an existing $BINARY on PATH is overwritten; otherwise the
+first usable of ~/.local/bin or ~/bin wins, falling back to /usr/local/bin —
+which needs sudo on most systems.
 EOF
 }
 
@@ -56,11 +57,16 @@ command -v git >/dev/null 2>&1 || {
 	exit 1
 }
 
-# Usable means writable without sudo: the directory is writable, or it is
-# missing and the nearest existing ancestor is writable (mkdir -p creates the
-# rest). Clobbers _dir/_parent, since POSIX sh has no `local`.
-dir_is_usable() {
-	_dir=$1
+# Usable means writable without sudo: the target binary (if it exists) and the
+# directory (or nearest existing ancestor) are writable. Clobbers _dir/_parent,
+# since POSIX sh has no `local`.
+target_is_usable() {
+	_target_dir=$1
+	_target_file=$_target_dir/$BINARY
+	if [ -e "$_target_file" ] && [ ! -w "$_target_file" ]; then
+		return 1
+	fi
+	_dir=$_target_dir
 	while [ ! -d "$_dir" ]; do
 		_parent=$(dirname "$_dir")
 		if [ "$_parent" = "$_dir" ]; then
@@ -71,11 +77,28 @@ dir_is_usable() {
 	[ -w "$_dir" ]
 }
 
+# If BINDIR was not explicitly set, check if an existing binary is on PATH so
+# we overwrite the existing build.
+if [ -z "$BINDIR" ]; then
+	if existing=$(command -v "$BINARY" 2>/dev/null) && [ -n "$existing" ]; then
+		existing_dir=$(dirname "$existing")
+		case $existing_dir in
+		/*) ;;
+		*) existing_dir=$PWD/$existing_dir ;;
+		esac
+		repo_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+		resolved_existing_dir=$(cd "$existing_dir" 2>/dev/null && pwd || true)
+		if [ -n "$resolved_existing_dir" ] && [ "$resolved_existing_dir" != "$repo_dir" ]; then
+			BINDIR=$existing_dir
+		fi
+	fi
+fi
+
 # HOME is unset in some headless and sudo environments, and set -u would abort
 # on "$HOME"; skipping straight to the fallback is the right answer there.
 if [ -z "$BINDIR" ] && [ -n "${HOME:-}" ]; then
 	for candidate in "$HOME/.local/bin" "$HOME/bin"; do
-		if dir_is_usable "$candidate"; then
+		if target_is_usable "$candidate"; then
 			BINDIR=$candidate
 			break
 		fi
@@ -109,7 +132,7 @@ printf '%s\n' "Building $BINARY..."
 go build -o "$tmpdir/$BINARY" .
 
 SUDO=
-if ! dir_is_usable "$BINDIR"; then
+if ! target_is_usable "$BINDIR"; then
 	command -v sudo >/dev/null 2>&1 || {
 		printf '%s\n' "install.sh: $BINDIR is not writable and sudo is unavailable" >&2
 		exit 1

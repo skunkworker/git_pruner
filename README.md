@@ -56,6 +56,7 @@ git_pruner version     # also --version, -v
 | `o`            | Reverse sort direction                                        |
 | `f`            | Toggle delete mode: safe `-d` <-> force `-D`                  |
 | `d` / `enter`  | Go to the confirmation screen                                 |
+| `?`            | Help screen (build metadata, keybindings, column guide)       |
 | `q` / `ctrl+c` | Quit                                                          |
 
 On the confirmation screen, `n`/`esc` cancels. When no remote deletions are armed, `y` deletes.

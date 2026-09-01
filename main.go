@@ -160,6 +160,15 @@ type model struct {
 	switching     bool   // a background git switch is in flight
 }
 
+// Build metadata. buildTime and gitCommit can be injected at link time via
+// -ldflags "-X main.buildTime=... -X main.gitCommit=..." (or -X main.buildDate=...);
+// when unset, buildInfo falls back to the VCS data the Go toolchain embeds.
+var (
+	buildTime string
+	buildDate string
+	gitCommit string
+)
+
 // ---- styles ----
 
 var (
@@ -1703,9 +1712,12 @@ func (m model) helpView() string {
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("Gone branches are deleted with -D. Any holding commits that are not in\n" +
 		"the default branch are left unselected by p and flagged on the confirm screen."))
-	b.WriteString("\n")
+	b.WriteString("\n\n")
 
-	b.WriteString("\n")
+	commit, date := buildInfo()
+	b.WriteString(dimStyle.Render(fmt.Sprintf("build date: %s · commit: %s", date, commit)))
+	b.WriteString("\n\n")
+
 	b.WriteString(dimStyle.Render("press any key to return"))
 	b.WriteString("\n")
 	return b.String()
@@ -1882,29 +1894,53 @@ func (m model) resultParts() (header, body, footer []string) {
 
 func (m model) resultView() string { return m.page(m.resultParts()) }
 
-// versionString reports the build's commit and date using Go's automatic VCS
-// stamping (populated when built with `go build` inside the repo). Fields fall
-// back to "unknown" when build info is unavailable (e.g. `go run`).
-func versionString() string {
-	commit, date, goVer, dirty := "unknown", "unknown", "unknown", false
+// buildInfo returns the commit the binary was built from and when it was
+// compiled, preferring -ldflags values and falling back to Go's embedded VCS info.
+func buildInfo() (commit, date string) {
+	commit = gitCommit
+	date = buildTime
+	if date == "" {
+		date = buildDate
+	}
+	dirty := false
 	if info, ok := debug.ReadBuildInfo(); ok {
-		goVer = info.GoVersion
 		for _, s := range info.Settings {
 			switch s.Key {
 			case "vcs.revision":
-				commit = s.Value
+				if commit == "" {
+					commit = s.Value
+				}
 			case "vcs.time":
-				date = s.Value
+				if date == "" {
+					date = s.Value
+				}
 			case "vcs.modified":
 				dirty = s.Value == "true"
 			}
 		}
 	}
-	if len(commit) > 7 { // shorten a real SHA; the "unknown" fallback is 7 chars
+	if commit == "" {
+		commit = "unknown"
+	}
+	if date == "" {
+		date = "unknown"
+	}
+	if len(commit) > 7 && commit != "unknown" {
 		commit = commit[:7]
 	}
 	if dirty {
 		commit += " (dirty)"
+	}
+	return commit, date
+}
+
+// versionString reports the build's commit, date, and Go version. Fields fall
+// back to "unknown" when build info is unavailable (e.g. `go run`).
+func versionString() string {
+	commit, date := buildInfo()
+	goVer := "unknown"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		goVer = info.GoVersion
 	}
 	return fmt.Sprintf("git_pruner\n  commit: %s\n  date:   %s\n  go:     %s", commit, date, goVer)
 }

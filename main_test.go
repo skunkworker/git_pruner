@@ -2195,6 +2195,35 @@ func TestVersionString(t *testing.T) {
 	}
 }
 
+func TestHelpViewIncludesBuildMetadata(t *testing.T) {
+	m := model{width: 80, height: 24}
+	v := m.helpView()
+	for _, want := range []string{"git_pruner — help", "build date:", "commit:"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("help view missing %q:\n%s", want, v)
+		}
+	}
+}
+
+func TestBuildInfoLdflagsOverride(t *testing.T) {
+	origCommit, origDate, origTime := gitCommit, buildDate, buildTime
+	defer func() {
+		gitCommit, buildDate, buildTime = origCommit, origDate, origTime
+	}()
+
+	gitCommit = "abcdef123456"
+	buildDate = "2026-09-01"
+	buildTime = ""
+
+	commit, date := buildInfo()
+	if commit != "abcdef1" {
+		t.Fatalf("expected truncated commit abcdef1, got %q", commit)
+	}
+	if date != "2026-09-01" {
+		t.Fatalf("expected date 2026-09-01, got %q", date)
+	}
+}
+
 // setupGoneMerged builds n branches that are merged into main and report their
 // upstream as gone. The upstream is configured rather than pushed and pruned:
 // git reads "gone" straight out of the config when the remote-tracking ref is
