@@ -50,7 +50,7 @@ git_pruner version     # also --version, -v
 | `b`            | Switch to the branch under the cursor (`git switch`)          |
 | `/`            | Filter branches by name; `enter` keeps it, `esc` clears it    |
 | `r`            | Toggle "also delete remote" for the row (needs an upstream)   |
-| `v`            | View the branch's diff (green additions / red removals)       |
+| `v`            | View the branch's diff (through [delta](https://github.com/dandavison/delta) when installed) |
 | `x`            | Select gone branches that hold no unique work (no fetch)      |
 | `p`            | Fetch `--all --prune`, then select gone branches that hold no unique work |
 | `s`            | Cycle sort field: committerdate -> name -> ahead/behind       |

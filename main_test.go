@@ -2720,3 +2720,56 @@ func TestXSelectsSafeGoneBranches(t *testing.T) {
 		t.Fatalf("with nothing gone the status says so, got %q", m.status)
 	}
 }
+
+// The diff view pipes through delta when it is on the PATH and shows its
+// output as-is; without delta, or when delta fails, the raw lines come back
+// for the app's own coloring so the diff is never lost.
+func TestStyleDiffUsesDeltaWhenPresent(t *testing.T) {
+	diff := "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n"
+	bin := t.TempDir()
+	t.Setenv("PATH", bin)
+
+	lines, styled := styleDiff(diff, 80)
+	if styled || len(lines) != 6 {
+		t.Fatalf("without delta the raw lines must come back: styled=%v lines=%q", styled, lines)
+	}
+	if lines, styled := styleDiff("  \n", 80); styled || lines != nil {
+		t.Fatalf("an empty diff has no lines: styled=%v lines=%q", styled, lines)
+	}
+
+	fake := filepath.Join(bin, "delta")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho \"delta $*\"\n/bin/cat >/dev/null\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines, styled = styleDiff(diff, 120)
+	if !styled || len(lines) != 1 || lines[0] != "delta --paging=never --width=120" {
+		t.Fatalf("delta must run with the terminal width and its output shown as-is: styled=%v lines=%q", styled, lines)
+	}
+
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if lines, styled := styleDiff(diff, 80); styled || len(lines) != 6 {
+		t.Fatalf("a failing delta must fall back to the raw lines: styled=%v lines=%q", styled, lines)
+	}
+}
+
+// Delta's columns are sized to the terminal, so a resize while the diff is
+// open must run it again at the new width.
+func TestDiffRerendersOnResize(t *testing.T) {
+	bin := t.TempDir()
+	t.Setenv("PATH", bin)
+	if err := os.WriteFile(filepath.Join(bin, "delta"), []byte("#!/bin/sh\necho \"w $2\"\n/bin/cat >/dev/null\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := model{width: 80, height: 24, state: stateDiff, diffRaw: "-a\n+b\n"}
+	m.diffLines, m.diffStyled = styleDiff(m.diffRaw, m.width)
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m = nm.(model)
+	if !m.diffStyled || len(m.diffLines) != 1 || m.diffLines[0] != "w --width=140" {
+		t.Fatalf("resize must re-run delta at the new width, got %q", m.diffLines)
+	}
+	if o := stripANSI(m.diffView()); !strings.Contains(o, "· delta") || !strings.Contains(o, "w --width=140") {
+		t.Fatalf("the view must show delta's lines and name it:\n%s", o)
+	}
+}

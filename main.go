@@ -148,7 +148,9 @@ type model struct {
 
 	diffBranch string   // branch whose diff is shown in stateDiff
 	diffBase   string   // base ref the diff was computed against
-	diffLines  []string // raw lines of the diff being viewed
+	diffRaw    string   // unified diff as git produced it; delta is re-run from it on resize
+	diffLines  []string // display lines of the diff being viewed
+	diffStyled bool     // lines came from delta and carry their own colors
 	diffTop    int      // scroll offset within diffLines
 
 	bodyTop int // scroll offset within the confirm/force/result body (see page)
@@ -621,6 +623,25 @@ func loadDiff(name string) (diff, base string, err error) {
 	return diff, shortRef(ref), err
 }
 
+// styleDiff turns a unified diff into display lines. With delta on the PATH
+// its output is used as-is, so side-by-side, line numbers and theme all come
+// from the user's own delta config; the width is passed so delta lays the
+// columns out for this terminal. Without delta (or if it fails) the raw lines
+// are returned for colorizeDiffLine.
+func styleDiff(diff string, width int) (lines []string, styled bool) {
+	if strings.TrimSpace(diff) == "" {
+		return nil, false
+	}
+	if path, err := exec.LookPath("delta"); err == nil {
+		cmd := exec.Command(path, "--paging=never", "--width="+strconv.Itoa(width))
+		cmd.Stdin = strings.NewReader(diff)
+		if out, err := cmd.Output(); err == nil {
+			return strings.Split(strings.TrimRight(string(out), "\n"), "\n"), true
+		}
+	}
+	return strings.Split(strings.TrimRight(diff, "\n"), "\n"), false
+}
+
 // ---- model ----
 
 func initialModel() (model, error) {
@@ -759,6 +780,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		if m.state == stateDiff && m.diffStyled {
+			// delta laid its columns out for the old width
+			m.diffLines, m.diffStyled = styleDiff(m.diffRaw, m.width)
+		}
 		m.adjustScroll()
 		return m, nil
 	case fetchDoneMsg:
@@ -957,11 +982,8 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.err = ""
 			m.diffBranch = b.name
 			m.diffBase = base
-			if strings.TrimSpace(diff) == "" {
-				m.diffLines = nil
-			} else {
-				m.diffLines = strings.Split(strings.TrimRight(diff, "\n"), "\n")
-			}
+			m.diffRaw = diff
+			m.diffLines, m.diffStyled = styleDiff(diff, m.width)
 			m.diffTop = 0
 			m.state = stateDiff
 		}
@@ -1456,7 +1478,11 @@ func (m model) diffView() string {
 	var b strings.Builder
 
 	base := m.diffBase
-	b.WriteString(headerStyle.Render(fmt.Sprintf("diff — %s (vs %s)", m.diffBranch, base)))
+	title := fmt.Sprintf("diff — %s (vs %s)", m.diffBranch, base)
+	if m.diffStyled {
+		title += " · delta"
+	}
+	b.WriteString(headerStyle.Render(title))
 	b.WriteString("\n\n")
 
 	if len(m.diffLines) == 0 {
@@ -1470,7 +1496,11 @@ func (m model) diffView() string {
 	vis := m.visibleRows()
 	end := min(m.diffTop+vis, len(m.diffLines))
 	for i := m.diffTop; i < end; i++ {
-		b.WriteString(colorizeDiffLine(truncate(m.diffLines[i], m.width)))
+		line := truncate(m.diffLines[i], m.width)
+		if !m.diffStyled {
+			line = colorizeDiffLine(line)
+		}
+		b.WriteString(line)
 		b.WriteString("\n")
 	}
 
@@ -1719,7 +1749,7 @@ func (m model) helpView() string {
 		{"b", "switch to the branch under the cursor"},
 		{"/", "filter by name (enter keep · esc clear)"},
 		{"r", "toggle delete of upstream remote branch"},
-		{"v", "view branch diff (green add / red remove)"},
+		{"v", "view branch diff (through delta when installed)"},
 		{"x", "select gone branches that hold no unique work"},
 		{"p", "fetch --all --prune, then do the same as x"},
 		{"s", "cycle sort field (date, name, ahead/behind)"},
