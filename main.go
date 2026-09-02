@@ -174,6 +174,7 @@ var (
 var (
 	currentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
 	cursorStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	rowBgStyle   = lipgloss.NewStyle().Background(lipgloss.Color("236")) // cursor row band
 	selStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	goneStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
@@ -772,32 +773,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// sortBranches) and the user's pending marks survive it.
 			m.applyBranches(carryMarks(m.branches, branches), reads)
 		}
-		// Auto-select only gone branches that carry nothing missing from the
-		// base. Ones holding unique commits are left unselected so discarding
-		// them stays a deliberate keystroke rather than a side effect of `p`.
-		gone, risky := 0, 0
-		for i := range m.branches {
-			br := &m.branches[i]
-			if !br.gone || br.isCurrent {
-				continue
-			}
-			gone++
-			if br.riskCommits > 0 {
-				risky++
-				continue
-			}
-			br.selected = true
-		}
 		m.err = ""
-		switch {
-		case gone == 0:
-			m.status = "fetched & pruned — no gone branches"
-		case risky == 0:
-			m.status = fmt.Sprintf("fetched & pruned — %d gone branch(es) selected; press d to prune", gone)
-		default:
-			m.status = fmt.Sprintf("fetched & pruned — %d of %d gone branch(es) selected; %d hold commits not in %s (select with space to discard)",
-				gone-risky, gone, risky, m.riskBase)
-		}
+		m.status = "fetched & pruned — " + m.selectGone()
 		return m, nil
 	case switchDoneMsg:
 		m.switching = false
@@ -958,6 +935,11 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.sortBranches()
 	case "f":
 		m.force = !m.force
+	case "x":
+		// The same selection `p` makes after its fetch, for a repo whose
+		// gone marks are already known; no network round trip needed.
+		m.err = ""
+		m.status = m.selectGone()
 	case "p":
 		if !m.fetching {
 			m.fetching = true
@@ -1556,7 +1538,7 @@ func (m model) listView() string {
 	if m.state == stateFilter {
 		help = "type to filter · enter keep · esc clear · backspace edit"
 	} else {
-		help = "↑/↓ move · space select · a/n all/none · b switch · / filter · r remote · v view · p prune · s sort · o order · f force · d delete · ? help · q quit"
+		help = "↑/↓ move · space select · a/n all/none · b switch · / filter · r remote · v view · x gone · p prune · s sort · o order · f force · d delete · ? help · q quit"
 	}
 	b.WriteString(dimStyle.Render(help))
 	if m.status != "" {
@@ -1568,6 +1550,35 @@ func (m model) listView() string {
 		b.WriteString(errStyle.Render(m.err))
 	}
 	return b.String()
+}
+
+// selectGone selects every gone branch that carries nothing missing from the
+// base and reports the outcome for the status line. Branches holding unique
+// commits stay unselected so discarding them is a deliberate keystroke rather
+// than a side effect of `p` or `x`.
+func (m *model) selectGone() string {
+	gone, risky := 0, 0
+	for i := range m.branches {
+		br := &m.branches[i]
+		if !br.gone || br.isCurrent {
+			continue
+		}
+		gone++
+		if br.riskCommits > 0 {
+			risky++
+			continue
+		}
+		br.selected = true
+	}
+	switch {
+	case gone == 0:
+		return "no gone branches"
+	case risky == 0:
+		return fmt.Sprintf("%d gone branch(es) selected; press d to prune", gone)
+	default:
+		return fmt.Sprintf("%d of %d gone branch(es) selected; %d hold commits not in %s (select with space to discard)",
+			gone-risky, gone, risky, m.riskBase)
+	}
 }
 
 func (m model) renderRow(br branch, nameW int, isCursor bool) string {
@@ -1590,14 +1601,16 @@ func (m model) renderRow(br branch, nameW int, isCursor bool) string {
 
 	name := pad(truncate(br.name, nameW), nameW)
 
+	// Selection outranks the cursor: the row band already marks the cursor,
+	// and a name that stays yellow under it keeps the pending delete visible.
 	var nameRendered string
 	switch {
-	case isCursor:
-		nameRendered = cursorStyle.Render(name)
-	case br.isCurrent:
-		nameRendered = currentStyle.Render(name)
 	case br.selected:
 		nameRendered = selStyle.Render(name)
+	case br.isCurrent:
+		nameRendered = currentStyle.Render(name)
+	case isCursor:
+		nameRendered = cursorStyle.Render(name)
 	default:
 		nameRendered = nameStyle.Render(name)
 	}
@@ -1607,10 +1620,32 @@ func (m model) renderRow(br branch, nameW int, isCursor bool) string {
 	rel := fmt.Sprintf("%-13s", br.committedRel)
 	hash := fmt.Sprintf("%-8s", br.hash)
 
-	return fmt.Sprintf("%s%s %s %s %s  %s %s %s %s %s",
+	row := fmt.Sprintf("%s%s %s %s %s  %s %s %s %s %s",
 		cursor, sel, rem, cur, nameRendered, track,
 		dimStyle.Render(abs), dimStyle.Render(rel), hashStyle.Render(hash),
 		subjectStyle.Render(truncate(br.subject, m.subjectWidth(nameW))))
+	if isCursor {
+		row = highlightRow(row, m.width)
+	}
+	return row
+}
+
+// highlightRow paints the cursor band behind an already-styled row. Each
+// column ends with a reset that would drop a background wrapped around the
+// whole row, so the band is re-armed after every reset instead. The row is
+// padded first so the band spans the full terminal width.
+func highlightRow(row string, width int) string {
+	const reset = "\x1b[0m"
+	// Rendering nothing yields just the on/off sequences, or "" when the
+	// color profile disables styling — then there is no band to paint.
+	on, ok := strings.CutSuffix(rowBgStyle.Render(""), reset)
+	if !ok || on == "" {
+		return row
+	}
+	if d := width - ansi.StringWidth(row); d > 0 {
+		row += strings.Repeat(" ", d)
+	}
+	return on + strings.ReplaceAll(row, reset, reset+on) + reset
 }
 
 func (m model) trackStr(br branch) string {
@@ -1685,7 +1720,8 @@ func (m model) helpView() string {
 		{"/", "filter by name (enter keep · esc clear)"},
 		{"r", "toggle delete of upstream remote branch"},
 		{"v", "view branch diff (green add / red remove)"},
-		{"p", "fetch --all --prune & select safe gone branches"},
+		{"x", "select gone branches that hold no unique work"},
+		{"p", "fetch --all --prune, then do the same as x"},
 		{"s", "cycle sort field (date, name, ahead/behind)"},
 		{"o", "toggle sort order (asc/desc)"},
 		{"f", "toggle force delete (-d / -D)"},
@@ -1711,7 +1747,7 @@ func (m model) helpView() string {
 
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("Gone branches are deleted with -D. Any holding commits that are not in\n" +
-		"the default branch are left unselected by p and flagged on the confirm screen."))
+		"the default branch are left unselected by x/p and flagged on the confirm screen."))
 	b.WriteString("\n\n")
 
 	commit, date := buildInfo()

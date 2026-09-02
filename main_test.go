@@ -14,7 +14,9 @@ import (
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 )
 
 // key builds a rune KeyMsg (e.g. "y", "R") for driving update handlers in tests.
@@ -2629,5 +2631,92 @@ func TestFilterCursorClamps(t *testing.T) {
 	m = press(t, m, key("G"), key("/"), key("main"))
 	if len(m.viewIdx()) != 1 || m.cursor != 0 {
 		t.Fatalf("filter must clamp the cursor into view: cursor=%d rows=%d", m.cursor, len(m.viewIdx()))
+	}
+}
+
+// withColor forces styled output for one test: go test has no TTY, so
+// lipgloss otherwise renders nothing but plain text.
+func withColor(t *testing.T) {
+	t.Helper()
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	t.Cleanup(func() { lipgloss.SetColorProfile(prev) })
+}
+
+// The cursor row carries a background band across the whole terminal width.
+// Every column resets its own style, so the band must be re-armed after each
+// reset or it would end at the first column boundary.
+func TestCursorRowBand(t *testing.T) {
+	withColor(t)
+	m := model{width: 100}
+	br := branch{name: "feature/x", upstream: "origin/feature/x", gone: true, subject: "wip"}
+	on, _ := strings.CutSuffix(rowBgStyle.Render(""), "\x1b[0m")
+	if on == "" {
+		t.Fatal("precondition: the band style must render a background sequence")
+	}
+
+	row := m.renderRow(br, 12, true)
+	if !strings.HasPrefix(row, on) || !strings.HasSuffix(row, "\x1b[0m") {
+		t.Fatalf("cursor row must open the band and close it at the end:\n%q", row)
+	}
+	for _, seg := range strings.Split(strings.TrimSuffix(row, "\x1b[0m"), "\x1b[0m")[1:] {
+		if !strings.HasPrefix(seg, on) {
+			t.Fatalf("band must be re-armed after every reset, missing before %q", seg)
+		}
+	}
+	if w := ansi.StringWidth(row); w != m.width {
+		t.Fatalf("band must span the terminal: row is %d cells, want %d", w, m.width)
+	}
+
+	if plain := m.renderRow(br, 12, false); strings.Contains(plain, on) {
+		t.Fatalf("only the cursor row carries the band:\n%q", plain)
+	}
+}
+
+// A selected branch keeps its yellow name under the cursor: the band already
+// marks the cursor, and the color is what says "this will be deleted".
+func TestSelectedNameStaysYellowUnderCursor(t *testing.T) {
+	withColor(t)
+	m := model{width: 100}
+	name := pad("feature/x", 12)
+	br := branch{name: "feature/x", selected: true}
+	row := m.renderRow(br, 12, true)
+	if !strings.Contains(row, selStyle.Render(name)) {
+		t.Fatalf("selected name must use the selection color under the cursor:\n%q", row)
+	}
+	if strings.Contains(row, cursorStyle.Render(name)) {
+		t.Fatalf("selected name must not use the cursor color:\n%q", row)
+	}
+	// Unselected rows keep the cursor color on the name.
+	br.selected = false
+	if row := m.renderRow(br, 12, true); !strings.Contains(row, cursorStyle.Render(name)) {
+		t.Fatalf("unselected cursor row must use the cursor color:\n%q", row)
+	}
+}
+
+// x selects the gone branches p would select, without a fetch: risk-free ones
+// only, never the current branch, with the same status wording.
+func TestXSelectsSafeGoneBranches(t *testing.T) {
+	m := model{width: 100, riskBase: "origin/main", branches: []branch{
+		{name: "main", isCurrent: true},
+		{name: "safe", upstream: "origin/safe", gone: true},
+		{name: "risky", upstream: "origin/risky", gone: true, riskCommits: 2},
+		{name: "live", upstream: "origin/live"},
+		{name: "cur-gone", upstream: "origin/cur-gone", gone: true, isCurrent: true},
+	}}
+	m = press(t, m, key("x"))
+	want := map[string]bool{"safe": true}
+	for _, b := range m.branches {
+		if b.selected != want[b.name] {
+			t.Fatalf("branch %q selected=%v, want %v", b.name, b.selected, want[b.name])
+		}
+	}
+	if !strings.Contains(m.status, "1 of 2 gone branch(es) selected") || !strings.Contains(m.status, "1 hold commits not in origin/main") {
+		t.Fatalf("status must report the skipped branch, got %q", m.status)
+	}
+
+	m.branches = m.branches[:1]
+	if m = press(t, m, key("x")); m.status != "no gone branches" {
+		t.Fatalf("with nothing gone the status says so, got %q", m.status)
 	}
 }

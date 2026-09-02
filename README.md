@@ -51,6 +51,7 @@ git_pruner version     # also --version, -v
 | `/`            | Filter branches by name; `enter` keeps it, `esc` clears it    |
 | `r`            | Toggle "also delete remote" for the row (needs an upstream)   |
 | `v`            | View the branch's diff (green additions / red removals)       |
+| `x`            | Select gone branches that hold no unique work (no fetch)      |
 | `p`            | Fetch `--all --prune`, then select gone branches that hold no unique work |
 | `s`            | Cycle sort field: committerdate -> name -> ahead/behind       |
 | `o`            | Reverse sort direction                                        |
@@ -112,6 +113,10 @@ Press `p` to run `git fetch --all --prune` in the background (the UI stays respo
 finishes, any local branch whose upstream was deleted is marked **gone**, and a status line
 reports what was found. Press `d` to review and delete them.
 
+If the branches are already marked **gone** (from an earlier fetch), press `x` to select them
+without another fetch. Both keys skip gone branches that hold commits not in the base branch;
+select those with `space` if you really want to discard them.
+
 This is the interactive equivalent of:
 
 ```sh
@@ -119,7 +124,7 @@ git fetch --all --prune && git branch -vv | awk '/: gone]/{print $1}' | xargs gi
 ```
 
 Gone branches are always removed with `git branch -D` (force), since `-d` refuses a branch whose
-upstream no longer exists — this is why selecting them via `p` prunes them even in safe mode.
+upstream no longer exists — this is why selecting them via `x`/`p` prunes them even in safe mode.
 
 Because `-D` discards unmerged commits and git reports **no ahead/behind count for a gone
 branch**, git_pruner measures each one against the default branch with `git cherry` and counts
