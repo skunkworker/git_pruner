@@ -253,7 +253,7 @@ branch names; `enter` keeps it, `esc` clears it, and `a` selects only the listed
 cursor and scroll offsets are positions in the filtered view (`viewIdx`); marks stay on the
 branch structs, so hidden rows keep theirs.
 
-**9b. `b` branch switch.** ✅ Done (2026-08-31). `git switch` on the cursor row — it resolves
+**9b. `c` branch checkout (was `b`).** ✅ Done (2026-08-31). `git switch` on the cursor row — it resolves
 branch names only, so the tag-shadowing rule holds without qualification. Part of a deliberate
 shift toward a general interactive branch tool, not just pruning.
 
@@ -272,18 +272,18 @@ naturally with finding 1.
 
 ### Reviewed and deferred (2026-08-31 /simplify pass)
 
-Two efficiency findings from the four-agent review of the `b` switch and `/` filter change.
+Two efficiency findings from the four-agent review of the `c` checkout and `/` filter change.
 Both were skipped deliberately: each trades an unmeasurable speed gain for a new way to show
 stale data. Recorded here so the analysis is not redone from scratch.
 
-**D1. Light reload after a branch switch.** A `b` press costs 5 fixed git calls plus one
+**D1. Light reload after a branch switch.** A `c` press costs 5 fixed git calls plus one
 `git cherry` per gone branch (~100 calls, ~100 ms on the 100-gone-branch repo) — all in the
 background since the switch runs as a `tea.Cmd`. A checkout moves HEAD only, so
 `remoteMerged`, `riskCommits`, the risk base and `m.baseMerged` are provably unchanged; a
 light path would run only `loadBranches()` + `localMergedSet()` (2 calls) and carry the rest
 across by name, refreshing just `isCurrent` and `headMerged`. **Why deferred:** the carried
 field list is an unchecked claim ("all fields a checkout cannot change"); anyone extending
-`refreshMergeInfo` must remember to update it, or `b` becomes the one path that shows stale
+`refreshMergeInfo` must remember to update it, or `c` becomes the one path that shows stale
 data. The full reload is right by construction. **If ever done:** pin the carried fields with
 a test that compares the light path against a fresh full reload on the same repo. This is the
 only deferred item worth revisiting, and only if a real repo shows the background reload

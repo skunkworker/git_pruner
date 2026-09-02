@@ -2446,11 +2446,11 @@ func cursorTo(t *testing.T, m *model, name string) {
 	}
 }
 
-// doSwitch presses b and, when a switch starts, drives its async cmd to
+// doSwitch presses c and, when a switch starts, drives its async cmd to
 // completion the way the tea runtime would.
 func doSwitch(t *testing.T, m model) model {
 	t.Helper()
-	nm, cmd := m.Update(key("b"))
+	nm, cmd := m.Update(key("c"))
 	m = nm.(model)
 	if cmd == nil {
 		return m // guarded no-op: nothing was started
@@ -2612,7 +2612,7 @@ func TestFilterNoMatches(t *testing.T) {
 		t.Fatalf("empty match must say so:\n%s", out)
 	}
 	// No visible row: cursor keys and actions must not panic or act.
-	m = press(t, m, special(tea.KeyEnter), key(" "), key("b"), key("G"))
+	m = press(t, m, special(tea.KeyEnter), key(" "), key("c"), key("G"))
 	if b := m.cur(); b != nil {
 		t.Fatalf("no branch should be under the cursor, got %+v", b)
 	}

@@ -987,7 +987,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.diffTop = 0
 			m.state = stateDiff
 		}
-	case "b":
+	case "c":
 		if b := m.cur(); b != nil && !b.isCurrent && !m.switching && !m.fetching {
 			m.switching = true
 			m.err = ""
@@ -1568,7 +1568,7 @@ func (m model) listView() string {
 	if m.state == stateFilter {
 		help = "type to filter · enter keep · esc clear · backspace edit"
 	} else {
-		help = "↑/↓ move · space select · a/n all/none · b switch · / filter · r remote · v view · x gone · p prune · s sort · o order · f force · d delete · ? help · q quit"
+		help = "↑/↓ move · space select · a/n all/none · c checkout · / filter · r remote · v view · x gone · p prune · s sort · o order · f force · d delete · ? help · q quit"
 	}
 	b.WriteString(dimStyle.Render(help))
 	if m.status != "" {
@@ -1746,7 +1746,7 @@ func (m model) helpView() string {
 		{"g/G, home/end", "jump to first/last"},
 		{"space", "select / deselect branch"},
 		{"a / n", "select all listed / none"},
-		{"b", "switch to the branch under the cursor"},
+		{"c", "checkout the branch under the cursor"},
 		{"/", "filter by name (enter keep · esc clear)"},
 		{"r", "toggle delete of upstream remote branch"},
 		{"v", "view branch diff (through delta when installed)"},

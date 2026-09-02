@@ -47,7 +47,7 @@ git_pruner version     # also --version, -v
 | `g` / `G`      | Jump to top / bottom                                          |
 | `space`        | Toggle selection (the current branch cannot be selected)     |
 | `a` / `n`      | Select all listed branches / clear selection                 |
-| `b`            | Switch to the branch under the cursor (`git switch`)          |
+| `c`            | Checkout the branch under the cursor (`git switch`)           |
 | `/`            | Filter branches by name; `enter` keeps it, `esc` clears it    |
 | `r`            | Toggle "also delete remote" for the row (needs an upstream)   |
 | `v`            | View the branch's diff (through [delta](https://github.com/dandavison/delta) when installed) |
