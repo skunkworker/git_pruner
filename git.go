@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,16 +12,23 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
-// branch holds the metadata git_pruner displays and acts on for one local branch.
+// branch holds the metadata git_pruner displays and acts on for one local
+// branch, or for one remote branch with no local copy (remoteOnly).
 type branch struct {
-	name         string
+	name         string // "feature"; for a remoteOnly row, the tracking name "origin/feature"
 	hash         string
+	sha          string // full commit ID; what undo recreates the branch at
 	subject      string
 	committed    time.Time
 	committedRel string
 	upstream     string // e.g. "origin/feature"; "" when no upstream is configured
+	upRemote     string // branch.<name>.remote, kept so undo can restore tracking
+	upMerge      string // branch.<name>.merge, e.g. "refs/heads/feature"
 	ahead        int
 	behind       int
 	gone         bool // upstream was configured but no longer exists
@@ -29,11 +37,34 @@ type branch struct {
 	riskCommits  int  // commits whose patch is not in the base branch; -D discards them
 	riskMeasured bool // riskCommits has been computed (0 is a meaningful value)
 	isCurrent    bool
+	worktree     bool // checked out in another worktree; git refuses to delete it
+	protected    bool // matches the default branch or a pruner.protect pattern
+	remoteOnly   bool // a remote branch that no local branch tracks
 	selected     bool
 	deleteRemote bool
 }
 
+// remoteArmed reports whether deleting b includes its remote branch. Selecting
+// a remoteOnly row arms it: deleting the remote branch is all it offers.
+func (b branch) remoteArmed() bool { return (b.deleteRemote || b.remoteOnly) && b.upstream != "" }
+
+// locked reports whether b can never be marked for deletion.
+func (b branch) locked() bool { return b.isCurrent || b.worktree || b.protected }
+
+// ref is b's fully qualified ref (see branchRef).
+func (b branch) ref() string {
+	if b.remoteOnly {
+		return "refs/remotes/" + b.name
+	}
+	return branchRef(b.name)
+}
+
+// remoteName prefers the configured remote: it is the truth, while the tracking
+// name is only a convention that custom refspecs break.
 func (b branch) remoteName() string {
+	if b.upRemote != "" && b.upRemote != "." {
+		return b.upRemote
+	}
 	if name, _, ok := strings.Cut(b.upstream, "/"); ok {
 		return name
 	}
@@ -41,6 +72,9 @@ func (b branch) remoteName() string {
 }
 
 func (b branch) remoteBranch() string {
+	if s, ok := strings.CutPrefix(b.upMerge, "refs/heads/"); ok {
+		return s
+	}
 	if _, name, ok := strings.Cut(b.upstream, "/"); ok {
 		return name
 	}
@@ -136,22 +170,61 @@ func runGit(args ...string) (string, error) {
 		defer netProcs.leave()
 	}
 
-	cmd := exec.Command("git", args...)
+	ctx := context.Background()
+	if net {
+		// A remote that stops answering would otherwise hold the slot, and the
+		// screen waiting on it, forever.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, netTimeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(ctx, "git", args...)
 	// Pin the locale: deleteBranch classifies failures by matching git's own
 	// error text, which gettext would otherwise translate. Everything else we
 	// parse is --format-driven and unaffected.
-	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	// GIT_TERMINAL_PROMPT=0 makes git fail instead of asking for a password: the
+	// TUI owns the terminal, so a prompt there can never be answered.
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "GIT_TERMINAL_PROMPT=0")
+	if net {
+		// ssh asks for passphrases on /dev/tty, past GIT_TERMINAL_PROMPT. With no
+		// controlling terminal it fails fast instead of fighting the TUI for input.
+		detachTTY(cmd)
+	}
+	// Once git is killed, an ssh child can still hold the pipes open; stop
+	// waiting on them shortly after.
+	cmd.WaitDelay = 2 * time.Second
 	var out, errBuf strings.Builder
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf
 	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(errBuf.String())
-		if msg == "" {
+		if ctx.Err() == context.DeadlineExceeded {
+			msg = fmt.Sprintf("git %s timed out after %s (the remote did not answer, or asked for a password)", args[0], netTimeout)
+		} else if msg == "" {
 			msg = err.Error()
 		}
-		return strings.TrimSpace(out.String()), fmt.Errorf("%s", msg)
+		return strings.TrimSpace(out.String()), fmt.Errorf("%s", cleanText(msg))
 	}
 	return out.String(), nil
+}
+
+// netTimeout bounds each network git call. A var so tests can shorten it.
+var netTimeout = 60 * time.Second
+
+// cleanText makes text from git safe to print in the TUI. Commit subjects and
+// remote error messages come from other people, so escape codes in them could
+// recolor or move the screen. Line breaks and tabs become spaces: every place
+// this text lands is one row.
+func cleanText(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\t':
+			return ' '
+		case unicode.IsControl(r):
+			return -1
+		}
+		return r
+	}, ansi.Strip(s))
 }
 
 // branchRef fully qualifies a local branch name. git's ref search order puts
@@ -184,9 +257,30 @@ func refExists(ref string) bool {
 
 var trackRe = regexp.MustCompile(`ahead (\d+)|behind (\d+)`)
 
+// commitFormat is the for-each-ref format shared by the local and remote
+// loaders. The subject goes last: it is the one free-text field.
+const commitFormat = "%(refname)%00%(objectname:short)%00%(objectname)%00" +
+	"%(committerdate:iso8601-strict)%00%(committerdate:relative)%00%(contents:subject)"
+
+// parseCommitFields reads commitFormat's fields into a branch.
+func parseCommitFields(f []string) branch {
+	b := branch{
+		name:         shortRef(f[0]),
+		hash:         f[1],
+		sha:          f[2],
+		committedRel: f[4],
+		subject:      cleanText(f[5]),
+	}
+	if t, err := time.Parse(time.RFC3339, f[3]); err == nil {
+		b.committed = t
+	}
+	return b
+}
+
 func loadBranches() ([]branch, error) {
-	const format = "%(refname)%00%(objectname:short)%00%(committerdate:iso8601-strict)%00" +
-		"%(committerdate:relative)%00%(upstream)%00%(upstream:track)%00%(HEAD)%00%(contents:subject)"
+	// Branch-only fields go first, so commitFormat's fields close the line.
+	const format = "%(upstream)%00%(upstream:track)%00%(HEAD)%00%(worktreepath)%00" +
+		"%(upstream:remotename)%00%(upstream:remoteref)%00" + commitFormat
 	out, err := runGit("for-each-ref", "--format="+format, "refs/heads")
 	if err != nil {
 		return nil, err
@@ -197,21 +291,16 @@ func loadBranches() ([]branch, error) {
 			continue
 		}
 		f := strings.Split(line, "\x00")
-		if len(f) < 8 {
+		if len(f) < 12 {
 			continue
 		}
-		b := branch{
-			name:         shortRef(f[0]),
-			hash:         f[1],
-			committedRel: f[3],
-			upstream:     shortRef(f[4]),
-			isCurrent:    f[6] == "*",
-			subject:      f[7],
-		}
-		if t, terr := time.Parse(time.RFC3339, f[2]); terr == nil {
-			b.committed = t
-		}
-		track := f[5]
+		b := parseCommitFields(f[6:])
+		b.upstream = shortRef(f[0])
+		b.isCurrent = f[2] == "*"
+		// %(worktreepath) is set for the current worktree's branch too.
+		b.worktree = f[3] != "" && !b.isCurrent
+		b.upRemote, b.upMerge = f[4], f[5]
+		track := f[1]
 		if strings.Contains(track, "gone") {
 			b.gone = true
 		}
@@ -236,29 +325,41 @@ type remoteRefs struct {
 	names  []string          // remote names, "origin" first
 	exists map[string]bool   // fully qualified ref -> present
 	symref map[string]string // fully qualified symbolic ref -> the ref it names
+	rows   []branch          // every non-symbolic remote branch; only when asked for
 }
 
 // loadRemoteRefs reads every remote-tracking ref in one call. The remote names
 // come out of the refs rather than out of `git remote`: a remote with no fetched
 // refs cannot supply a default branch, so it is nothing the caller could use.
-func loadRemoteRefs() remoteRefs {
+// withRows also reads each ref's commit for the remote view. That costs a commit
+// read per ref, so it is only paid once the user has opened that view.
+func loadRemoteRefs(withRows bool) remoteRefs {
 	rr := remoteRefs{exists: map[string]bool{}, symref: map[string]string{}}
-	out, err := runGit("for-each-ref", "--format=%(refname)%00%(symref)", "refs/remotes")
+	format := "%(symref)%00%(refname)"
+	if withRows {
+		format = "%(symref)%00" + commitFormat
+	}
+	out, err := runGit("for-each-ref", "--format="+format, "refs/remotes")
 	if err != nil {
 		return rr
 	}
 	seen := map[string]bool{}
 	for _, line := range strings.Split(out, "\n") {
-		ref, target := "", ""
-		if s := strings.TrimSpace(line); s != "" {
-			ref, target, _ = strings.Cut(s, "\x00")
-		}
-		if ref == "" {
+		f := strings.Split(strings.TrimSpace(line), "\x00")
+		if len(f) < 2 || f[1] == "" {
 			continue
 		}
+		ref, target := f[1], f[0]
 		rr.exists[ref] = true
 		if target != "" {
 			rr.symref[ref] = target
+		} else if withRows && len(f) >= 7 {
+			b := parseCommitFields(f[1:])
+			b.remoteOnly = true
+			// The row is its own upstream, which lets the merge query and the
+			// push --delete path treat it like a local branch's remote copy.
+			b.upstream = b.name
+			rr.rows = append(rr.rows, b)
 		}
 		// The first segment after the namespace is the remote's name.
 		if name, _, ok := strings.Cut(shortRef(ref), "/"); ok && !seen[name] {
@@ -323,7 +424,7 @@ func remoteDefaultFrom(rr remoteRefs) string {
 
 // remoteDefault reads the remote-tracking refs and resolves the default branch
 // from them.
-func remoteDefault() string { return remoteDefaultFrom(loadRemoteRefs()) }
+func remoteDefault() string { return remoteDefaultFrom(loadRemoteRefs(false)) }
 
 // baseBranch returns the ref to diff a branch against: the remote default branch,
 // else a local main/master, excluding name itself.
@@ -341,8 +442,11 @@ func baseBranch(name string) string {
 // squashed as a group still count, since no equivalent single patch exists;
 // the warning is therefore worded as "not in <base>", not "will be lost".
 // Returns 0 when there is nothing to compare against.
-func riskCommitCount(name, base string) int {
-	ref := branchRef(name)
+func riskCommitCount(name, base string) int { return riskCommitCountRef(branchRef(name), base) }
+
+// riskCommitCountRef is riskCommitCount for any fully qualified ref, which is
+// what lets a remote branch be measured the same way.
+func riskCommitCountRef(ref, base string) int {
 	if base == "" || base == ref {
 		return 0
 	}
@@ -395,23 +499,53 @@ func localMergedSet() map[string]bool { return mergedSet("branch", "--merged", "
 type repoReads struct {
 	headMerged map[string]bool // local branches merged into HEAD
 	remotes    remoteRefs
+	config     prunerConfig
+}
+
+// prunerConfig is the tool's own git config, under the pruner.* section.
+type prunerConfig struct {
+	protect   []string // pruner.protect: branch name globs that can never be marked
+	staleDays int      // pruner.staleDays: the default age for the merged-and-old rule
+}
+
+// defaultStaleDays is the age the merged-and-old rule starts from.
+const defaultStaleDays = 90
+
+// loadConfig reads every pruner.* key in one call. Unset is the usual case, and
+// git exits 1 for it, so an error only means "use the defaults".
+func loadConfig() prunerConfig {
+	c := prunerConfig{staleDays: defaultStaleDays}
+	out, _ := runGit("config", "--get-regexp", `^pruner\.`)
+	for _, line := range strings.Split(out, "\n") {
+		key, val, _ := strings.Cut(strings.TrimSpace(line), " ")
+		switch key {
+		case "pruner.protect":
+			c.protect = append(c.protect, strings.Fields(val)...)
+		case "pruner.staledays":
+			if n, err := strconv.Atoi(val); err == nil && n >= 0 {
+				c.staleDays = n
+			}
+		}
+	}
+	return c
 }
 
 // loadRepo reads the branch list and everything independent of it in one round.
-// Starting a git subprocess costs about 6ms, and none of these three waits on
+// Starting a git subprocess costs about 6ms, and none of these reads waits on
 // another, so the depth of the chain is what the user waits on — not the work
 // inside it.
-func loadRepo() ([]branch, repoReads, error) {
+func loadRepo(withRemote bool) ([]branch, repoReads, error) {
 	var (
 		branches []branch
 		err      error
 		reads    repoReads
 	)
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 	go func() { defer wg.Done(); branches, err = loadBranches() }()
 	go func() { defer wg.Done(); reads.headMerged = localMergedSet() }()
-	go func() { defer wg.Done(); reads.remotes = loadRemoteRefs() }()
+	go func() { defer wg.Done(); reads.remotes = loadRemoteRefs(withRemote) }()
+	go func() { defer wg.Done(); reads.config = loadConfig() }()
 	wg.Wait()
 	return branches, reads, err
 }
@@ -419,13 +553,17 @@ func loadRepo() ([]branch, repoReads, error) {
 // loadDiff returns the patch introduced on name relative to its merge-base with
 // the repo's default branch — i.e. what the branch contains — and the base it was
 // compared against, shortened for display.
-func loadDiff(name string) (diff, base string, err error) {
-	ref := baseBranch(name)
-	if ref == "" {
-		ref = "HEAD"
+func loadDiff(name string) (diff, base string, err error) { return loadDiffRef(branchRef(name), name) }
+
+// loadDiffRef is loadDiff for any fully qualified ref; name is the short name
+// that must not be picked as its own base.
+func loadDiffRef(ref, name string) (diff, base string, err error) {
+	baseRef := baseBranch(name)
+	if baseRef == "" || baseRef == ref {
+		baseRef = "HEAD"
 	}
-	diff, err = runGit("diff", ref+"..."+branchRef(name))
-	return diff, shortRef(ref), err
+	diff, err = runGit("diff", baseRef+"..."+ref)
+	return diff, shortRef(baseRef), err
 }
 
 // styleDiff turns a unified diff into display lines. With delta on the PATH
@@ -444,7 +582,13 @@ func styleDiff(diff string, width int) (lines []string, styled bool) {
 			return strings.Split(strings.TrimRight(string(out), "\n"), "\n"), true
 		}
 	}
-	return strings.Split(strings.TrimRight(diff, "\n"), "\n"), false
+	// The file contents are someone else's text; clean each line like a subject.
+	// Tabs are widened first, or cleanText would flatten indentation to one space.
+	lines = strings.Split(strings.TrimRight(diff, "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = cleanText(strings.ReplaceAll(l, "\t", "    "))
+	}
+	return lines, false
 }
 
 // deleteFlag returns the git branch delete flag for b under the given force mode.
@@ -460,6 +604,13 @@ func (b branch) deleteFlag(force bool) string {
 // update loop, one cmd per branch.
 func deleteBranch(b branch, flag string, wantRemote bool) deleteResult {
 	res := deleteResult{br: b, done: true}
+	if b.remoteOnly {
+		// There is no local branch; the push is the whole job.
+		if wantRemote {
+			pushRemoteDelete(&res)
+		}
+		return res
+	}
 	if _, err := runGit("branch", flag, b.name); err != nil {
 		res.localErr = err.Error()
 		// Only an unmerged refusal is worth escalating to -D. Other failures — a
@@ -495,4 +646,22 @@ func pushRemoteDelete(res *deleteResult) {
 	} else {
 		res.remoteOK = true
 	}
+}
+
+// restoreBranch recreates a deleted local branch at its old commit and puts its
+// upstream config back; `git branch -d` removes both. The commit is still in the
+// object store (git only prunes unreachable objects after weeks), so this works
+// long after the delete.
+func restoreBranch(b branch) error {
+	if _, err := runGit("branch", "--no-track", b.name, b.sha); err != nil {
+		return err
+	}
+	if b.upRemote == "" || b.upMerge == "" {
+		return nil
+	}
+	if _, err := runGit("config", "branch."+b.name+".remote", b.upRemote); err != nil {
+		return err
+	}
+	_, err := runGit("config", "branch."+b.name+".merge", b.upMerge)
+	return err
 }

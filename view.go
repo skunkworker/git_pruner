@@ -167,7 +167,10 @@ func (m model) diffView() string {
 	var b strings.Builder
 
 	base := m.diffBase
-	title := fmt.Sprintf("diff — %s (vs %s)", m.diffBranch, base)
+	title := "diff — " + m.diffBranch
+	if base != "" {
+		title += " (vs " + base + ")"
+	}
 	if m.diffStyled {
 		title += " · delta"
 	}
@@ -175,14 +178,18 @@ func (m model) diffView() string {
 	b.WriteString("\n\n")
 
 	if len(m.diffLines) == 0 {
-		b.WriteString(dimStyle.Render("no changes — branch matches " + base))
+		msg := "no changes — branch matches " + base
+		if m.diffLoading {
+			msg = "loading diff…"
+		}
+		b.WriteString(dimStyle.Render(msg))
 		b.WriteString("\n\n")
 		b.WriteString(dimStyle.Render("q/esc back · v back"))
 		b.WriteString("\n")
 		return b.String()
 	}
 
-	vis := m.visibleRows()
+	vis := m.diffRows()
 	end := min(m.diffTop+vis, len(m.diffLines))
 	for i := m.diffTop; i < end; i++ {
 		line := truncate(m.diffLines[i], m.width)
@@ -223,21 +230,43 @@ func (m model) listView() string {
 		forceLabel = "FORCE (-D)"
 	}
 	idx := m.viewIdx()
-	header := fmt.Sprintf("git_pruner — %d branches   sort: %s %s   delete mode: %s",
-		len(m.branches), m.field, dir, forceLabel)
-	b.WriteString(headerStyle.Render(header))
-	if m.filter != "" || m.state == stateFilter {
+	kind, other, total := "local", "remote", 0
+	if m.showRemote {
+		kind, other = "remote-only", "local"
+	}
+	for _, br := range m.branches {
+		if m.inView(br) {
+			total++
+		}
+	}
+	// The prompts come before the settings, so a narrow terminal cuts the
+	// settings rather than what the user is typing.
+	header := headerStyle.Render(fmt.Sprintf("git_pruner — %d %s branches", total, kind))
+	switch {
+	case m.state == stateAge:
+		header += selStyle.Render(fmt.Sprintf("   merged & older than: %s▌ days (enter select · esc cancel)", m.ageInput))
+	case m.filter != "" || m.state == stateFilter:
 		f := m.filter
 		if m.state == stateFilter {
 			f += "▌"
 		}
-		b.WriteString(selStyle.Render(fmt.Sprintf("   filter: %s (%d/%d)", f, len(idx), len(m.branches))))
+		header += selStyle.Render(fmt.Sprintf("   filter: %s (%d/%d)", f, len(idx), total))
 	}
+	header += headerStyle.Render(fmt.Sprintf("   sort: %s %s   delete mode: %s", m.field, dir, forceLabel)) +
+		dimStyle.Render("   tab: "+other)
+	if m.merging {
+		header += dimStyle.Render(" · reading merge status…")
+	}
+	// Every line is cut to the terminal: a wrapped line takes two screen rows
+	// that visibleRows did not count, and pushes the bottom lines off.
+	b.WriteString(truncate(header, m.width))
 	b.WriteString("\n\n")
 
 	switch {
-	case len(m.branches) == 0:
-		b.WriteString(dimStyle.Render("no local branches found"))
+	case total == 0 && m.showRemote && m.status != "":
+		// the load is still running; the status line says so
+	case total == 0:
+		b.WriteString(dimStyle.Render("no " + kind + " branches found"))
 		b.WriteString("\n")
 	case len(idx) == 0:
 		b.WriteString(dimStyle.Render("no branches match filter"))
@@ -246,27 +275,38 @@ func (m model) listView() string {
 
 	nameW := m.nameW
 	vis := m.visibleRows()
-	end := min(m.top+vis, len(idx))
-	for p := m.top; p < end; p++ {
+	// A status line that appeared since the last move takes a row; keep the
+	// cursor inside the smaller window.
+	top := min(m.top, m.cursor)
+	if m.cursor >= top+vis {
+		top = m.cursor - vis + 1
+	}
+	end := min(top+vis, len(idx))
+	for p := top; p < end; p++ {
 		b.WriteString(m.renderRow(m.branches[idx[p]], nameW, p == m.cursor))
 		b.WriteString("\n")
 	}
 
 	b.WriteString("\n")
 	var help string
-	if m.state == stateFilter {
+	switch {
+	case m.state == stateFilter:
 		help = "type to filter · enter keep · esc clear · backspace edit"
-	} else {
-		help = "↑/↓ move · space select · a/n all/none · c checkout · / filter · r remote · v view · x gone · p prune · s sort · o order · f force · d delete · ? help · q quit"
+	case m.state == stateAge:
+		help = "type the age in days · enter select · esc cancel"
+	case m.showRemote:
+		help = "? help · q quit · tab local · space select · a/n all/none · m merged+old · d delete · c checkout · / filter · v view · s sort · o order"
+	default:
+		help = "? help · q quit · space select · a/n all/none · m merged+old · x gone · p prune · d delete · u undo · tab remote · / filter · r remote · v view · c checkout · s sort · o order · f force"
 	}
-	b.WriteString(dimStyle.Render(help))
+	b.WriteString(dimStyle.Render(truncate(help, m.width)))
 	if m.status != "" {
 		b.WriteString("\n")
-		b.WriteString(okStyle.Render(m.status))
+		b.WriteString(okStyle.Render(truncate(m.status, m.width)))
 	}
 	if m.err != "" {
 		b.WriteString("\n")
-		b.WriteString(errStyle.Render(m.err))
+		b.WriteString(errStyle.Render(truncate(m.err, m.width)))
 	}
 	return b.String()
 }
@@ -281,15 +321,22 @@ func (m model) renderRow(br branch, nameW int, isCursor bool) string {
 		sel = selStyle.Render("[x]")
 	}
 	rem := " "
-	if br.deleteRemote {
+	if br.deleteRemote || (br.remoteOnly && br.selected) {
 		rem = errStyle.Render("R")
 	}
+	// One marker column, in the order git's own `git branch` would show them.
 	cur := " "
-	if br.isCurrent {
+	switch {
+	case br.isCurrent:
 		cur = currentStyle.Render("*")
+	case br.worktree:
+		cur = hunkStyle.Render("+")
+	case br.protected:
+		cur = dimStyle.Render("P")
 	}
 
-	name := pad(truncate(br.name, nameW), nameW)
+	c := m.rowLayout(nameW)
+	name := pad(truncate(br.name, c.nameW), c.nameW)
 
 	// Selection outranks the cursor: the row band already marks the cursor,
 	// and a name that stays yellow under it keeps the pending delete visible.
@@ -301,23 +348,81 @@ func (m model) renderRow(br branch, nameW int, isCursor bool) string {
 		nameRendered = currentStyle.Render(name)
 	case isCursor:
 		nameRendered = cursorStyle.Render(name)
+	case br.locked():
+		nameRendered = dimStyle.Render(name)
 	default:
 		nameRendered = nameStyle.Render(name)
 	}
 
-	track := m.trackStr(br)
-	abs := fmt.Sprintf("%-11s", br.committed.Format("2006-Jan-02"))
-	rel := fmt.Sprintf("%-13s", br.committedRel)
-	hash := fmt.Sprintf("%-8s", br.hash)
-
-	row := fmt.Sprintf("%s%s %s %s %s  %s %s %s %s %s",
-		cursor, sel, rem, cur, nameRendered, track,
-		dimStyle.Render(abs), dimStyle.Render(rel), hashStyle.Render(hash),
-		subjectStyle.Render(truncate(br.subject, m.subjectWidth(nameW))))
+	row := fmt.Sprintf("%s%s %s %s %s  %s", cursor, sel, rem, cur, nameRendered, m.trackStr(br))
+	if c.abs {
+		row += " " + dimStyle.Render(fmt.Sprintf("%-11s", br.committed.Format("2006-Jan-02")))
+	}
+	if c.rel {
+		row += " " + dimStyle.Render(fmt.Sprintf("%-13s", br.committedRel))
+	}
+	if c.hash {
+		row += " " + hashStyle.Render(fmt.Sprintf("%-8s", br.hash))
+	}
+	if c.subject > 0 {
+		row += " " + subjectStyle.Render(truncate(br.subject, c.subject))
+	}
+	// Last guard against a wrap on a terminal too narrow for even the fixed columns.
+	row = ansi.Truncate(row, max(1, m.width), "")
 	if isCursor {
 		row = highlightRow(row, m.width)
 	}
 	return row
+}
+
+// rowCols says which optional columns fit the terminal, and how wide the name
+// and subject may be.
+type rowCols struct {
+	abs, rel, hash bool
+	nameW, subject int
+}
+
+// Column widths in renderRow's format. rowFixed is cursor(2) + [x](3) + space +
+// R(1) + space + marker(1) + space + name's two trailing spaces + track(10).
+const (
+	rowFixed   = 2 + 3 + 1 + 1 + 1 + 1 + 1 + 2 + 10
+	absCost    = 1 + 11
+	relCost    = 1 + 13
+	hashCost   = 1 + 8
+	minSubject = 10
+)
+
+// rowLayout fits a row to m.width. A row wider than the terminal wraps onto a
+// second screen line, which visibleRows does not count, so the list overruns
+// and pushes the footer off. The optional columns go in order of least use —
+// relative date, hash, absolute date — until a readable subject fits; then the
+// name shrinks. O(1).
+func (m model) rowLayout(nameW int) rowCols {
+	c := rowCols{abs: true, rel: true, hash: true, nameW: nameW}
+	cost := func() int {
+		n := rowFixed + c.nameW
+		if c.abs {
+			n += absCost
+		}
+		if c.rel {
+			n += relCost
+		}
+		if c.hash {
+			n += hashCost
+		}
+		return n
+	}
+	for _, drop := range []*bool{&c.rel, &c.hash, &c.abs} {
+		if m.width-cost()-1 >= minSubject {
+			break
+		}
+		*drop = false
+	}
+	if over := cost() - m.width; over > 0 {
+		c.nameW = max(6, c.nameW-over)
+	}
+	c.subject = max(0, m.width-cost()-1)
+	return c
 }
 
 // highlightRow paints the cursor band behind an already-styled row. Each
@@ -339,6 +444,13 @@ func highlightRow(row string, width int) string {
 }
 
 func (m model) trackStr(br branch) string {
+	if br.remoteOnly {
+		s := dimStyle.Render("remote")
+		if br.remoteMerged {
+			s += okStyle.Render(" ✓")
+		}
+		return trackColStyle.Render(s)
+	}
 	if br.gone {
 		// Same column style as every other track value, or the columns that
 		// follow shift left on exactly the rows the user is here to act on.
@@ -361,14 +473,6 @@ func (m model) trackStr(br branch) string {
 		s += okStyle.Render(" ✓")
 	}
 	return trackColStyle.Render(s)
-}
-
-func (m model) subjectWidth(nameW int) int {
-	// Sum of every fixed column width and separator in renderRow's format,
-	// plus nameW; keep in sync with that format string. The 10 is the track
-	// column (trackColStyle width); the trailing 8 is the hash column.
-	used := 2 + 3 + 1 + 1 + 1 + 1 + 1 + 1 + nameW + 2 + 10 + 1 + 11 + 1 + 13 + 1 + 8 + 1
-	return max(10, m.width-used)
 }
 
 // truncate shortens s to w terminal cells, appending an ellipsis when it does
@@ -406,12 +510,15 @@ func (m model) helpView() string {
 		{"g/G, home/end", "jump to first/last"},
 		{"space", "select / deselect branch"},
 		{"a / n", "select all listed / none"},
-		{"c", "checkout the branch under the cursor"},
+		{"m", "select listed branches merged and older than N days"},
+		{"tab", "switch between local and remote-only branches"},
+		{"c", "checkout the branch (remote: new local tracking branch)"},
 		{"/", "filter by name (enter keep · esc clear)"},
 		{"r", "toggle delete of upstream remote branch"},
 		{"v", "view branch diff (through delta when installed)"},
 		{"x", "select gone branches that hold no unique work"},
 		{"p", "fetch --all --prune, then do the same as x"},
+		{"u", "undo: recreate the branches the last delete removed"},
 		{"s", "cycle sort field (date, name, ahead/behind)"},
 		{"o", "toggle sort order (asc/desc)"},
 		{"f", "toggle force delete (-d / -D)"},
@@ -427,7 +534,7 @@ func (m model) helpView() string {
 	b.WriteString(headerStyle.Render("Columns"))
 	b.WriteString("\n")
 	writeRows([][2]string{
-		{"*", "current branch (cannot be deleted)"},
+		{"* / + / P", "current / in another worktree / protected (locked)"},
 		{"[x]", "selected for deletion"},
 		{"R", "its remote branch will also be deleted"},
 		{"↑/↓", "commits ahead of / behind upstream"},
@@ -437,7 +544,8 @@ func (m model) helpView() string {
 
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("Gone branches are deleted with -D. Any holding commits that are not in\n" +
-		"the default branch are left unselected by x/p and flagged on the confirm screen."))
+		"the default branch are left unselected by x/p and flagged on the confirm screen.\n" +
+		"Protect more branches with: git config --add pruner.protect 'release/*'"))
 	b.WriteString("\n\n")
 
 	commit, date := buildInfo()
@@ -455,12 +563,12 @@ func (m model) confirmParts() (header, body, footer []string) {
 	if m.force {
 		flag = "-D (force)"
 	}
-	remoteCount := countArmedRemotes(sel)
+	remoteCount, localCount := countArmedRemotes(sel), m.localSelectedCount()
 	header = []string{
 		headerStyle.Render("Confirm deletion"),
 		"",
 		fmt.Sprintf("Local delete mode: %s", flag),
-		fmt.Sprintf("Deleting %d local branch(es), %d remote branch(es).", len(sel), remoteCount),
+		fmt.Sprintf("Deleting %d local branch(es), %d remote branch(es).", localCount, remoteCount),
 		"",
 	}
 
@@ -474,6 +582,8 @@ func (m model) confirmParts() (header, body, footer []string) {
 		body = append(body, "      "+dimStyle.Render(fmt.Sprintf("%s  %s  %s", br.hash, date, truncate(br.subject, 50))))
 
 		switch {
+		case br.remoteOnly:
+			body = append(body, "      "+dimStyle.Render("remote branch — no local copy"))
 		case br.gone:
 			body = append(body, "      "+goneStyle.Render("upstream gone: "+br.upstream+" — will prune with -D (force)"))
 		case br.upstream != "":
@@ -482,7 +592,15 @@ func (m model) confirmParts() (header, body, footer []string) {
 			body = append(body, "      "+dimStyle.Render("no upstream"))
 		}
 
-		if br.upstream != "" && m.remoteDefault != "" {
+		switch {
+		case br.gone:
+			// A gone branch has no upstream left to test, so remoteMerged is
+			// always false for it. The risk count is the real answer: say so
+			// when it is clean, and riskWarning speaks when it is not.
+			if br.riskMeasured && br.riskCommits == 0 && m.riskBase != "" {
+				body = append(body, "      "+okStyle.Render("✓ no commits missing from "+m.riskBase))
+			}
+		case br.upstream != "" && m.remoteDefault != "":
 			if br.remoteMerged {
 				body = append(body, "      "+okStyle.Render("✓ merged into "+m.remoteDefault))
 			} else {
@@ -490,7 +608,7 @@ func (m model) confirmParts() (header, body, footer []string) {
 			}
 		}
 
-		if br.deleteRemote && br.upstream != "" {
+		if br.deleteRemote && br.upstream != "" && !br.remoteOnly {
 			body = append(body, "      "+errStyle.Render(fmt.Sprintf("+ delete remote %s/%s", br.remoteName(), br.remoteBranch())))
 		}
 		if w := m.riskWarning(br); w != "" {
@@ -500,7 +618,10 @@ func (m model) confirmParts() (header, body, footer []string) {
 	}
 
 	prompt := headerStyle.Render("Delete these branches? ")
-	if remoteCount > 0 {
+	if localCount == 0 {
+		// Only remote rows: there is no local-only delete to offer on y.
+		prompt += dimStyle.Render(fmt.Sprintf("(R = delete %d remote branch(es) · n/esc = cancel)", remoteCount))
+	} else if remoteCount > 0 {
 		prompt += dimStyle.Render(fmt.Sprintf("(y = local only · R = local + remote (%d) · n/esc = cancel)", remoteCount))
 	} else {
 		prompt += dimStyle.Render("(y = yes · n/esc = cancel)")
@@ -515,6 +636,12 @@ func (m model) confirmView() string { return m.page(m.confirmParts()) }
 // which take the -D path regardless: under -D the unmerged commits are
 // discarded, under -d the delete simply fails.
 func (m model) riskWarning(br branch) string {
+	if br.remoteOnly {
+		if br.riskCommits > 0 {
+			return fmt.Sprintf("⚠ %d commit(s) not in %s — this may be the only shared copy of them", br.riskCommits, m.riskBase)
+		}
+		return ""
+	}
 	if br.safeDeletable() && !br.gone {
 		return ""
 	}
@@ -541,12 +668,14 @@ func (m model) forcePromptParts() (header, body, footer []string) {
 		headerStyle.Render("Force delete unmerged branches?"),
 		"",
 		fmt.Sprintf("%d branch(es) were refused by safe delete (-d) because they are not", len(failures)),
-		"fully merged. Force deleting (-D) will " + errStyle.Render("permanently discard their unmerged commits") + ".",
+		"fully merged. Force deleting (-D) will " + errStyle.Render("discard their unmerged commits") + ".",
+		dimStyle.Render("To get one back: press u on the next screen, or run git branch <name> <commit>."),
+		dimStyle.Render("git keeps the commits for a few weeks, until gc prunes them."),
 		"",
 	}
 
 	for _, r := range failures {
-		body = append(body, "  "+cursorStyle.Render("• "+r.br.name))
+		body = append(body, "  "+cursorStyle.Render("• "+r.br.name)+dimStyle.Render("  at "+r.br.hash))
 		// Every branch here failed -d, so its risk was measured before the delete
 		// ran: riskCommits == 0 means either nothing is missing from the base or
 		// there was no base to measure against.
@@ -575,19 +704,25 @@ func (m model) forcePromptView() string { return m.page(m.forcePromptParts()) }
 // appendResultLines adds one completed deletion result (local, then remote if
 // tried) to dst. Shared by the results screen and the live deleting screen.
 func appendResultLines(dst []string, r deleteResult) []string {
-	if r.localOK {
-		dst = append(dst, okStyle.Render("  ✓ ")+"deleted local "+r.br.name)
-	} else {
+	switch {
+	case r.br.remoteOnly:
+		// No local branch: the remote line below is the whole result.
+	case r.restored:
+		dst = append(dst, okStyle.Render("  ↺ ")+"restored local "+r.br.name+" at "+r.br.hash)
+	case r.localOK:
+		dst = append(dst, okStyle.Render("  ✓ ")+"deleted local "+r.br.name+dimStyle.Render(" (was "+r.br.hash+")"))
+	default:
 		dst = append(dst, errStyle.Render("  ✗ ")+"local "+r.br.name+": "+r.localErr)
 	}
+	remote := r.br.remoteName() + "/" + r.br.remoteBranch()
 	switch {
 	case r.remoteSkipped:
 		// Say why the armed remote survived, or it reads as a silent failure.
-		dst = append(dst, errStyle.Render("  ! ")+"kept remote "+r.br.remoteName()+"/"+r.br.remoteBranch()+": local delete failed")
+		dst = append(dst, errStyle.Render("  ! ")+"kept remote "+remote+": local delete failed")
 	case r.remoteTried && r.remoteOK:
-		dst = append(dst, okStyle.Render("  ✓ ")+"deleted remote "+r.br.name)
+		dst = append(dst, okStyle.Render("  ✓ ")+"deleted remote "+remote+dimStyle.Render(" (was "+r.br.hash+")"))
 	case r.remoteTried:
-		dst = append(dst, errStyle.Render("  ✗ ")+"remote "+r.br.name+": "+r.remoteErr)
+		dst = append(dst, errStyle.Render("  ✗ ")+"remote "+remote+": "+r.remoteErr)
 	}
 	return dst
 }
@@ -605,7 +740,11 @@ func (m model) deletingParts() (header, body, footer []string) {
 			body = append(body, dimStyle.Render("  "+spin+" deleting "+r.br.name+"…"))
 		}
 	}
-	return header, body, []string{"", dimStyle.Render("working — ctrl+c to abort")}
+	footer = []string{"", dimStyle.Render("working — ctrl+c to abort")}
+	if m.abortArmed {
+		footer[1] = errStyle.Render("quitting now can leave a remote branch undeleted — ctrl+c again to quit anyway")
+	}
+	return header, body, footer
 }
 
 func (m model) deletingView() string { return m.page(m.deletingParts()) }
@@ -615,7 +754,14 @@ func (m model) resultParts() (header, body, footer []string) {
 	for _, r := range m.results {
 		body = appendResultLines(body, r)
 	}
-	return header, body, []string{"", dimStyle.Render("press q/enter to quit")}
+	footer = []string{"", dimStyle.Render("enter back to list · q quit")}
+	for _, r := range m.results {
+		if r.restorable() {
+			footer[1] = dimStyle.Render("u undo (recreate the local branches) · enter back to list · q quit")
+			break
+		}
+	}
+	return header, body, footer
 }
 
 func (m model) resultView() string { return m.page(m.resultParts()) }

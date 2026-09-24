@@ -75,16 +75,23 @@ func main() {
 			fmt.Println(versionString())
 			return
 		}
+		os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
 	}
 
-	m, err := initialModel()
+	settingsPath = defaultSettingsPath()
+	m, err := startupModel()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "git_pruner:", err)
 		os.Exit(1)
 	}
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
-	if _, err := p.Run(); err != nil {
+	final, err := p.Run()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "git_pruner:", err)
 		os.Exit(1)
+	}
+	// Printed after the alt screen closes, so the commands stay in scrollback.
+	if fm, ok := final.(model); ok {
+		fmt.Print(restoreSummary(append(fm.history, fm.results...)))
 	}
 }

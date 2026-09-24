@@ -2,7 +2,10 @@ package main
 
 import (
 	"fmt"
+	"path"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +45,7 @@ const (
 	stateHelp
 	stateDiff
 	stateFilter // the list, with the filter line capturing keystrokes
+	stateAge    // the list, with the merged-and-old prompt capturing digits
 )
 
 type deleteResult struct {
@@ -57,10 +61,16 @@ type deleteResult struct {
 	// because the local delete failed — the one piece of state not derivable
 	// from br, since arming is the caller's decision.
 	remoteSkipped bool
+	restored      bool // undo recreated the local branch
+}
+
+// restorable reports whether undo can bring r's local branch back.
+func (r deleteResult) restorable() bool {
+	return r.localOK && !r.restored && r.br.sha != ""
 }
 
 type model struct {
-	branches []branch
+	branches []branch // local rows and, once loaded, remoteOnly rows
 	cursor   int
 	top      int // index of first visible row (scroll window)
 
@@ -69,27 +79,45 @@ type model struct {
 	force     bool
 	nameW     int // cached branch-name column width (see recomputeNameWidth)
 
-	filter string // active branch-name filter; "" shows every branch
+	filter     string // active branch-name filter; "" shows every branch
+	ageInput   string // digits typed into the merged-and-old prompt
+	showRemote bool   // the list shows remoteOnly rows instead of local ones
+	// remoteLoaded records that the remote rows were asked for once; every
+	// later reload then keeps them current.
+	remoteLoaded bool
 
 	state   viewState
 	results []deleteResult
+	history []deleteResult // earlier runs this session, for the exit summary
+	// abortArmed is set by a first ctrl+c while deletions run. Quitting then
+	// can strand a remote copy, so a second press is needed.
+	abortArmed bool
 
-	remoteDefault string // resolved remote default branch, e.g. "origin/main"
-	riskBase      string // ref that branch.riskCommits is measured against ("" if unresolved)
-	riskBaseRef   string // riskBase fully qualified, so a same-named tag cannot shadow it
+	config           prunerConfig
+	remoteDefault    string // resolved remote default branch, e.g. "origin/main"
+	remoteDefaultRef string // remoteDefault fully qualified
+	riskBase         string // ref that branch.riskCommits is measured against ("" if unresolved)
+	riskBaseRef      string // riskBase fully qualified, so a same-named tag cannot shadow it
 	// baseMerged holds the local branches whose tip is an ancestor of riskBaseRef.
 	// Their riskCommits is 0 by definition, so one query here removes a `git
 	// cherry` subprocess per branch (see measureRisk).
 	baseMerged map[string]bool
+	// merging is set while the startup merge queries run in the background.
+	// Until they land, ✓ marks and risk counts are unknown, so the keys that
+	// select by them wait.
+	merging bool
+	loadGen int // bumped per branch load, so a late merge result for an old list is dropped
 
 	spinnerFrame int // animation frame for the deleting spinner (deletion counts derive from results)
 
-	diffBranch string   // branch whose diff is shown in stateDiff
-	diffBase   string   // base ref the diff was computed against
-	diffRaw    string   // unified diff as git produced it; delta is re-run from it on resize
-	diffLines  []string // display lines of the diff being viewed
-	diffStyled bool     // lines came from delta and carry their own colors
-	diffTop    int      // scroll offset within diffLines
+	diffBranch  string   // branch whose diff is shown in stateDiff
+	diffBase    string   // base ref the diff was computed against
+	diffRaw     string   // unified diff as git produced it; delta is re-run from it on resize
+	diffLines   []string // display lines of the diff being viewed
+	diffStyled  bool     // lines came from delta and carry their own colors
+	diffTop     int      // scroll offset within diffLines
+	diffLoading bool     // the diff (or its re-layout) is being made in the background
+	diffSeq     int      // bumped per diff request, so a slow answer for an old one is dropped
 
 	bodyTop int // scroll offset within the confirm/force/result body (see page)
 
@@ -116,23 +144,96 @@ func fetchPruneCmd() tea.Cmd {
 // switchDoneMsg reports completion of an async `git switch`, carrying the
 // reloaded repo so the reads run off the update loop too.
 type switchDoneMsg struct {
-	name     string
-	err      error // the switch itself failed; the repo is untouched
-	branches []branch
-	reads    repoReads
-	loadErr  error
+	name       string // the local branch now checked out
+	fromRemote bool   // the switch created name from a remoteOnly row
+	err        error  // the switch itself failed; the repo is untouched
+	branches   []branch
+	reads      repoReads
+	loadErr    error
 }
 
-// switchCmd checks out the named branch and reloads the repo, off the update
-// loop like every other mutation (see fetchPruneCmd). `git switch` resolves
-// branch names only, so a same-named tag cannot shadow it (see branchRef).
-func switchCmd(name string) tea.Cmd {
+// switchCmd checks out b and reloads the repo, off the update loop like every
+// other mutation (see fetchPruneCmd). `git switch` resolves branch names only,
+// so a same-named tag cannot shadow it (see branchRef). A remoteOnly row gets a
+// new local branch that tracks it; the start point is the full ref, because a
+// bare "origin/x" would lose to a tag of that name.
+func switchCmd(b branch, withRemote bool) tea.Cmd {
+	args := []string{"switch", b.name}
+	msg := switchDoneMsg{name: b.name}
+	if b.remoteOnly {
+		msg.name, msg.fromRemote = b.remoteBranch(), true
+		args = []string{"switch", "-c", msg.name, "--track", b.ref()}
+	}
 	return func() tea.Msg {
-		msg := switchDoneMsg{name: name}
-		if _, msg.err = runGit("switch", name); msg.err != nil {
+		if _, msg.err = runGit(args...); msg.err != nil {
 			return msg
 		}
-		msg.branches, msg.reads, msg.loadErr = loadRepo()
+		msg.branches, msg.reads, msg.loadErr = loadRepo(withRemote)
+		return msg
+	}
+}
+
+// repoLoadedMsg carries a background reload (see reloadCmd).
+type repoLoadedMsg struct {
+	branches []branch
+	reads    repoReads
+	err      error
+}
+
+// reloadCmd reloads the repo off the update loop. The first switch to the
+// remote view uses it: reading every remote ref's commit can be slow on a big
+// remote.
+func reloadCmd(withRemote bool) tea.Cmd {
+	return func() tea.Msg {
+		b, r, err := loadRepo(withRemote)
+		return repoLoadedMsg{b, r, err}
+	}
+}
+
+// mergeInfo is the result of the merge queries (see queryMergeInfo).
+type mergeInfo struct {
+	remoteMerged map[string]bool // remote-tracking names merged into the remote default
+	baseMerged   map[string]bool // local branches whose tip is in the risk base
+	risk         map[string]int  // commits not in the base, by ref, for gone branches
+}
+
+// mergeInfoMsg carries the startup merge queries; gen ties it to one load.
+type mergeInfoMsg struct {
+	gen  int
+	info mergeInfo
+}
+
+// diffLoadedMsg carries a diff made in the background; seq ties it to one request.
+type diffLoadedMsg struct {
+	seq    int
+	base   string // "" on a re-layout: the base is unchanged
+	raw    string
+	lines  []string
+	styled bool
+	err    error
+}
+
+// diffCmd reads b's diff and lays it out, off the update loop: a big diff
+// through delta takes long enough to freeze the screen.
+func diffCmd(seq int, b branch, width int) tea.Cmd {
+	return func() tea.Msg {
+		msg := diffLoadedMsg{seq: seq}
+		msg.raw, msg.base, msg.err = loadDiffRef(b.ref(), b.name)
+		if msg.err == nil {
+			msg.lines, msg.styled = styleDiff(msg.raw, width)
+		}
+		return msg
+	}
+}
+
+// restyleTickMsg fires a moment after a resize (see the WindowSizeMsg case).
+type restyleTickMsg struct{ seq int }
+
+// restyleCmd re-runs delta on a diff already read, for a new terminal width.
+func restyleCmd(seq int, raw string, width int) tea.Cmd {
+	return func() tea.Msg {
+		msg := diffLoadedMsg{seq: seq, raw: raw}
+		msg.lines, msg.styled = styleDiff(raw, width)
 		return msg
 	}
 }
@@ -164,35 +265,61 @@ func spinnerTickCmd() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return spinnerTickMsg{} })
 }
 
-func initialModel() (model, error) {
-	// The repo check runs beside the reads rather than ahead of them. It is here
-	// to give a clearer message than git's own, not to gate the work, and a
-	// serial subprocess start is most of what startup costs.
+// loadFirst runs the startup reads. The repo check runs beside them rather than
+// ahead of them. It is here to give a clearer message than git's own, not to
+// gate the work, and a serial subprocess start is most of what startup costs.
+func loadFirst() ([]branch, repoReads, error) {
 	var repoErr error
 	checked := make(chan struct{})
 	go func() {
 		_, repoErr = runGit("rev-parse", "--is-inside-work-tree")
 		close(checked)
 	}()
-	branches, reads, err := loadRepo()
+	branches, reads, err := loadRepo(false)
 	<-checked
 
 	if repoErr != nil {
-		return model{}, fmt.Errorf("not a git repository (or git is unavailable)")
+		return nil, reads, fmt.Errorf("not a git repository (or git is unavailable)")
 	}
+	return branches, reads, err
+}
+
+// initialModel loads the repo with every merge query answered before it
+// returns. Script mode and the tests use it; the TUI uses startupModel.
+func initialModel() (model, error) {
+	m, err := startupModel()
+	if err == nil {
+		m.applyMergeInfo(m.mergeQuery()())
+	}
+	return m, err
+}
+
+// startupModel is initialModel without the wait for the merge queries: the list
+// paints after one round of git, and Init fills the ✓ and risk columns in.
+func startupModel() (model, error) {
+	branches, reads, err := loadFirst()
 	if err != nil {
 		return model{}, err
 	}
 	m := model{field: sortDate, ascending: false, height: 24, width: 100}
-	m.applyBranches(branches, reads)
+	loadSettings(&m) // a no-op unless main set settingsPath
+	m.installBranches(branches, reads)
+	m.merging = true
 	return m, nil
 }
 
+// sortBranches re-sorts and keeps the cursor on the branch it was on.
 func (m *model) sortBranches() {
 	current := ""
 	if b := m.cur(); b != nil {
 		current = b.name
 	}
+	m.sortRows()
+	m.focusBranch(current)
+	m.clampCursor()
+}
+
+func (m *model) sortRows() {
 	less := func(i, j int) bool {
 		a, b := m.branches[i], m.branches[j]
 		var r bool
@@ -210,8 +337,6 @@ func (m *model) sortBranches() {
 		return r
 	}
 	sort.SliceStable(m.branches, less)
-	m.focusBranch(current)
-	m.clampCursor()
 }
 
 // focusBranch puts the cursor on the named branch's view row. A filtered-out
@@ -236,7 +361,7 @@ func (m *model) clampCursor() {
 // scrollable view is active; other states ignore the wheel.
 func (m *model) scroll(delta int) {
 	switch m.state {
-	case stateList, stateFilter:
+	case stateList, stateFilter, stateAge:
 		m.cursor += delta
 		m.clampCursor()
 	case stateDiff:
@@ -248,9 +373,21 @@ func (m *model) scroll(delta int) {
 	}
 }
 
-func (m *model) visibleRows() int {
-	return max(1, m.height-5) // minus header (2) + footer (3)
+// visibleRows is how many branch rows fit: the header line and a blank above,
+// a blank and the help line below, and one line each for a status and an error.
+func (m model) visibleRows() int {
+	used := 4
+	if m.status != "" {
+		used++
+	}
+	if m.err != "" {
+		used++
+	}
+	return max(1, m.height-used)
 }
+
+// diffRows is how many diff lines fit between the title (2) and position (2) lines.
+func (m model) diffRows() int { return max(1, m.height-4) }
 
 func (m *model) adjustScroll() {
 	vis := m.visibleRows()
@@ -266,16 +403,24 @@ func (m *model) adjustScroll() {
 // viewIdx returns the indices of the branches the list shows, in display
 // order. The cursor and scroll offsets are positions in this view, not in
 // m.branches: marks live on the branches, so hiding a row must not move them.
+// The local and remote views are two filters over the one slice, for the same
+// reason.
 func (m model) viewIdx() []int {
 	idx := make([]int, 0, len(m.branches))
 	f := strings.ToLower(m.filter)
 	for i, b := range m.branches {
+		if !m.inView(b) {
+			continue
+		}
 		if f == "" || strings.Contains(strings.ToLower(b.name), f) {
 			idx = append(idx, i)
 		}
 	}
 	return idx
 }
+
+// inView reports whether b belongs to the view on screen, local or remote.
+func (m model) inView(b branch) bool { return b.remoteOnly == m.showRemote }
 
 func (m *model) cur() *branch {
 	if idx := m.viewIdx(); m.cursor >= 0 && m.cursor < len(idx) {
@@ -284,27 +429,79 @@ func (m *model) cur() *branch {
 	return nil
 }
 
+// selectedBranches returns the marked branches. Locked ones are dropped here
+// too, so a mark that slipped past the keys still cannot reach a delete.
 func (m model) selectedBranches() []branch {
 	var out []branch
 	for _, b := range m.branches {
-		if b.selected {
+		if b.selected && !b.locked() {
 			out = append(out, b)
 		}
 	}
 	return out
 }
 
-func (m model) Init() tea.Cmd { return nil }
+// Init starts the merge queries startupModel left out.
+func (m model) Init() tea.Cmd {
+	if !m.merging {
+		return nil
+	}
+	gen, query := m.loadGen, m.mergeQuery()
+	return func() tea.Msg { return mergeInfoMsg{gen: gen, info: query()} }
+}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		if m.state == stateDiff && m.diffStyled {
-			// delta laid its columns out for the old width
-			m.diffLines, m.diffStyled = styleDiff(m.diffRaw, m.width)
-		}
 		m.adjustScroll()
+		if m.state == stateDiff && m.diffStyled {
+			// delta laid its columns out for the old width. A window drag sends
+			// dozens of sizes; wait for them to stop, so delta runs once, not
+			// once per size.
+			m.diffSeq++
+			seq := m.diffSeq
+			return m, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg { return restyleTickMsg{seq} })
+		}
+		return m, nil
+	case restyleTickMsg:
+		if msg.seq != m.diffSeq || m.state != stateDiff {
+			return m, nil // a later resize took over, or the user left
+		}
+		m.diffLoading = true
+		return m, restyleCmd(m.diffSeq, m.diffRaw, m.width)
+	case mergeInfoMsg:
+		if msg.gen == m.loadGen {
+			m.applyMergeInfo(msg.info)
+		}
+		return m, nil
+	case diffLoadedMsg:
+		if msg.seq != m.diffSeq || m.state != stateDiff {
+			return m, nil // the user asked for another diff, or left
+		}
+		m.diffLoading = false
+		if msg.err != nil {
+			m.err = msg.err.Error()
+			m.state = stateList
+			return m, nil
+		}
+		if msg.base != "" {
+			m.diffBase = msg.base
+		}
+		m.diffRaw = msg.raw
+		m.diffLines, m.diffStyled = msg.lines, msg.styled
+		m.clampDiff()
+		return m, nil
+	case undoDoneMsg:
+		m.applyUndo(msg)
+		return m, nil
+	case repoLoadedMsg:
+		if msg.err != nil {
+			m.err = msg.err.Error()
+			return m, nil
+		}
+		m.status = ""
+		m.applyKeepMarks(msg.branches, msg.reads)
 		return m, nil
 	case fetchDoneMsg:
 		m.fetching = false
@@ -313,10 +510,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = ""
 			return m, nil
 		}
-		if branches, reads, err := loadRepo(); err == nil {
+		if branches, reads, err := loadRepo(m.remoteLoaded); err == nil {
 			// A fetch is non-destructive, so both the cursor (by name, in
-			// sortBranches) and the user's pending marks survive it.
-			m.applyBranches(carryMarks(m.branches, branches), reads)
+			// applyBranches) and the user's pending marks survive it.
+			m.applyKeepMarks(branches, reads)
 		}
 		m.err = ""
 		m.status = "fetched & pruned — " + m.selectGone()
@@ -332,10 +529,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = ""
 		m.status = "switched to " + msg.name
+		if msg.fromRemote {
+			m.showRemote = false // the new local branch is where the user is now
+		}
 		if msg.loadErr == nil {
 			// A switch deletes nothing, so pending marks survive it; carryMarks
 			// drops the ones now on the current branch.
-			m.applyBranches(carryMarks(m.branches, msg.branches), msg.reads)
+			m.applyKeepMarks(msg.branches, msg.reads)
 		}
 		m.focusBranch(msg.name)
 		return m, nil
@@ -345,7 +545,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.deletesDone() >= len(m.results) {
 			m.reloadBranches()
-			m.bodyTop = 0
+			m.bodyTop, m.abortArmed = 0, false
 			if len(m.forceableFailures()) > 0 {
 				m.state = stateForcePrompt
 			} else {
@@ -375,6 +575,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateList(msg)
 		case stateFilter:
 			return m.updateFilter(msg)
+		case stateAge:
+			return m.updateAge(msg)
 		case stateConfirm:
 			return m.updateConfirm(msg)
 		case stateForcePrompt:
@@ -382,14 +584,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case stateDiff:
 			return m.updateDiff(msg)
 		case stateDeleting:
-			// Deletions are in flight; ignore input except an abort.
+			// Deletions are in flight; ignore input except an abort. Quitting
+			// drops pushes not yet started, which can leave a remote copy
+			// behind a deleted local branch, so the abort needs a second press.
 			if msg.String() == "ctrl+c" {
-				return m, tea.Quit
+				if m.abortArmed {
+					return m, tea.Quit
+				}
+				m.abortArmed = true
 			}
 		case stateResult:
 			switch msg.String() {
-			case "q", "ctrl+c", "enter", "esc":
+			case "q", "ctrl+c":
 				return m, tea.Quit
+			case "enter", "esc":
+				m.state = stateList
+			case "u":
+				return m, m.undo()
 			default:
 				m.scrollKeys(msg.String())
 			}
@@ -429,6 +640,43 @@ func (m model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateAge handles the merged-and-old prompt. Only digits type into it.
+func (m model) updateAge(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.state = stateList
+	case "enter":
+		m.state = stateList
+		if days, err := strconv.Atoi(m.ageInput); err == nil {
+			m.err = ""
+			m.status = m.selectMergedOlder(days, time.Now())
+		}
+	case "backspace":
+		if n := len(m.ageInput); n > 0 {
+			m.ageInput = m.ageInput[:n-1]
+		}
+	default:
+		for _, r := range msg.Runes {
+			if r >= '0' && r <= '9' && len(m.ageInput) < 5 {
+				m.ageInput += string(r)
+			}
+		}
+	}
+	return m, nil
+}
+
+// waitForMerge reports whether a key must wait on the startup merge queries,
+// and says so on the status line: selecting before they land would act on
+// branches whose merge state is not yet known.
+func (m *model) waitForMerge() bool {
+	if m.merging {
+		m.status = "still reading merge status — try again in a moment"
+	}
+	return m.merging
+}
+
 func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
@@ -446,15 +694,25 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor = len(m.branches) // clampCursor lands it on the last visible row
 		m.clampCursor()
 	case " ":
-		if b := m.cur(); b != nil && !b.isCurrent {
+		if b := m.cur(); b != nil && !b.locked() {
 			b.selected = !b.selected
 		}
 	case "r":
-		if b := m.cur(); b != nil && b.upstream != "" && !b.isCurrent {
+		if b := m.cur(); b != nil && b.upstream != "" && !b.locked() && !b.remoteOnly {
 			b.deleteRemote = !b.deleteRemote
+		}
+	case "tab":
+		m.showRemote = !m.showRemote
+		m.cursor, m.top = 0, 0
+		if m.showRemote && !m.remoteLoaded {
+			m.remoteLoaded = true
+			m.status = "loading remote branches…"
+			return m, reloadCmd(true)
 		}
 	case "/":
 		m.state = stateFilter
+	case "m":
+		m.state, m.ageInput = stateAge, strconv.Itoa(m.config.staleDays)
 	case "esc":
 		// n already disarms everything; esc only lifts the filter.
 		m.filter = ""
@@ -463,7 +721,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Select what the list shows: with a filter active, a marks only the
 		// matching branches, which is what makes filter-then-select useful.
 		for _, i := range m.viewIdx() {
-			if !m.branches[i].isCurrent {
+			if !m.branches[i].locked() {
 				m.branches[i].selected = true
 			}
 		}
@@ -475,16 +733,22 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		m.field = (m.field + 1) % sortFieldCount
 		m.sortBranches()
+		saveSettings(m)
 	case "o":
 		m.ascending = !m.ascending
 		m.sortBranches()
+		saveSettings(m)
 	case "f":
 		m.force = !m.force
+	case "u":
+		return m, m.undo()
 	case "x":
 		// The same selection `p` makes after its fetch, for a repo whose
 		// gone marks are already known; no network round trip needed.
-		m.err = ""
-		m.status = m.selectGone()
+		if !m.waitForMerge() {
+			m.err = ""
+			m.status = m.selectGone()
+		}
 	case "p":
 		if !m.fetching {
 			m.fetching = true
@@ -494,30 +758,25 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "v":
 		if b := m.cur(); b != nil {
-			diff, base, err := loadDiff(b.name)
-			if err != nil {
-				m.err = err.Error()
-				break
-			}
 			m.err = ""
-			m.diffBranch = b.name
-			m.diffBase = base
-			m.diffRaw = diff
-			m.diffLines, m.diffStyled = styleDiff(diff, m.width)
-			m.diffTop = 0
+			m.diffSeq++
+			m.diffBranch, m.diffBase = b.name, ""
+			m.diffRaw, m.diffLines, m.diffStyled = "", nil, false
+			m.diffTop, m.diffLoading = 0, true
 			m.state = stateDiff
+			return m, diffCmd(m.diffSeq, *b, m.width)
 		}
 	case "c":
 		if b := m.cur(); b != nil && !b.isCurrent && !m.switching && !m.fetching {
 			m.switching = true
 			m.err = ""
 			m.status = "switching to " + b.name + "…"
-			return m, switchCmd(b.name)
+			return m, switchCmd(*b, m.remoteLoaded)
 		}
 	case "?":
 		m.state = stateHelp
 	case "d", "enter":
-		if len(m.selectedBranches()) > 0 {
+		if len(m.selectedBranches()) > 0 && !m.waitForMerge() {
 			m.measureSelectedRisk() // the confirm screen states what each delete costs
 			m.state, m.bodyTop = stateConfirm, 0
 		}
@@ -529,7 +788,9 @@ func (m model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y", "Y":
 		// Local only: never delete remotes on the same key that deletes locals.
-		return m, m.startDeletions(false)
+		if m.localSelectedCount() > 0 {
+			return m, m.startDeletions(false)
+		}
 	case "R":
 		// Local + remote — only meaningful when at least one remote is armed.
 		if m.armedRemoteCount() > 0 {
@@ -549,7 +810,7 @@ func (m model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func countArmedRemotes(branches []branch) int {
 	n := 0
 	for _, b := range branches {
-		if b.deleteRemote && b.upstream != "" {
+		if b.remoteArmed() {
 			n++
 		}
 	}
@@ -561,21 +822,39 @@ func (m model) armedRemoteCount() int {
 	return countArmedRemotes(m.selectedBranches())
 }
 
+// localSelectedCount counts selected branches that have a local branch to delete.
+func (m model) localSelectedCount() int {
+	n := 0
+	for _, b := range m.selectedBranches() {
+		if !b.remoteOnly {
+			n++
+		}
+	}
+	return n
+}
+
 // startDeletions kicks off the asynchronous deletion of the selected branches,
 // pre-seeding results, entering stateDeleting, and returning a batch of one cmd
 // per branch (which run concurrently) plus the spinner tick. Remote branches are
-// pushed --delete only when includeRemote is set (see updateConfirm).
+// pushed --delete only when includeRemote is set (see updateConfirm), so a
+// remoteOnly row is left out of a local-only run.
 func (m *model) startDeletions(includeRemote bool) tea.Cmd {
 	m.measureSelectedRisk() // results carry the cost through to the force prompt
-	sel := m.selectedBranches()
+	var sel []branch
+	for _, b := range m.selectedBranches() {
+		if includeRemote || !b.remoteOnly {
+			sel = append(sel, b)
+		}
+	}
+	m.history = append(m.history, m.results...)
 	m.results = make([]deleteResult, len(sel))
-	m.spinnerFrame = 0
+	m.spinnerFrame, m.abortArmed = 0, false
 	m.state, m.bodyTop = stateDeleting, 0
 
 	cmds := []tea.Cmd{spinnerTickCmd()}
 	for i, b := range sel {
 		m.results[i] = deleteResult{br: b}
-		wantRemote := includeRemote && b.deleteRemote && b.upstream != ""
+		wantRemote := includeRemote && b.remoteArmed()
 		cmds = append(cmds, deleteBranchCmd(i, b, b.deleteFlag(m.force), wantRemote))
 	}
 	return tea.Batch(cmds...)
@@ -620,7 +899,7 @@ func (m model) updateForcePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) clampDiff() {
-	m.diffTop = max(0, min(m.diffTop, len(m.diffLines)-m.visibleRows()))
+	m.diffTop = max(0, min(m.diffTop, len(m.diffLines)-m.diffRows()))
 }
 
 func (m model) updateDiff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -636,10 +915,10 @@ func (m model) updateDiff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.diffTop++
 		m.clampDiff()
 	case "ctrl+u", "pgup":
-		m.diffTop -= m.visibleRows() / 2
+		m.diffTop -= m.diffRows() / 2
 		m.clampDiff()
 	case "ctrl+d", "pgdown", " ":
-		m.diffTop += m.visibleRows() / 2
+		m.diffTop += m.diffRows() / 2
 		m.clampDiff()
 	case "g", "home":
 		m.diffTop = 0
@@ -651,140 +930,262 @@ func (m model) updateDiff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // carryMarks copies the user's pending selections from old onto a freshly loaded
-// branch set, matching by name. Used on the fetch path, which reloads every
+// branch set, matching by ref. Used on the fetch path, which reloads every
 // branch struct but changes nothing the marks were made about. An armed remote
 // delete is dropped when the fetch reveals the upstream is already gone: the push
 // it would run can only fail.
 func carryMarks(old, fresh []branch) []branch {
 	prev := make(map[string]branch, len(old))
 	for _, b := range old {
-		prev[b.name] = b
+		prev[b.ref()] = b
 	}
 	for i := range fresh {
-		if p, ok := prev[fresh[i].name]; ok {
+		if p, ok := prev[fresh[i].ref()]; ok {
 			// Marks never land on the current branch: it cannot be deleted, so
 			// a carried mark would arm an operation the list refuses to offer
 			// (relevant after a switch, or when HEAD moved outside the TUI).
-			fresh[i].selected = p.selected && !fresh[i].isCurrent
-			fresh[i].deleteRemote = p.deleteRemote && !fresh[i].gone && !fresh[i].isCurrent
+			// Protection is applied after this, and clears its own marks.
+			fresh[i].selected = p.selected && !fresh[i].locked()
+			fresh[i].deleteRemote = p.deleteRemote && !fresh[i].gone && !fresh[i].locked()
 		}
 	}
 	return fresh
 }
 
 // applyBranches installs a freshly-loaded branch set and recomputes everything
-// derived from it (name-width, merge info, sort order). Callers set their own
-// cursor policy around it. This is the single refresh core shared by
-// reloadBranches and the fetch handler.
+// derived from it (name-width, merge info, sort order). The cursor stays on the
+// branch it was on. This is the single refresh core shared by every reload.
 func (m *model) applyBranches(branches []branch, reads repoReads) {
-	m.branches = branches
-	m.recomputeNameWidth()
-	m.refreshMergeInfo(reads)
-	m.sortBranches()
+	m.installBranches(branches, reads)
+	m.applyMergeInfo(m.mergeQuery()())
 }
 
-// reloadBranches refreshes the branch list from git and resets the view to the
-// top — appropriate after a mutation that may have removed the cursor's branch.
-func (m *model) reloadBranches() {
-	if branches, reads, err := loadRepo(); err == nil {
-		m.cursor = 0
-		m.top = 0
-		m.applyBranches(branches, reads)
+// applyKeepMarks is applyBranches for a reload that deleted nothing, so the
+// user's pending marks carry over by ref.
+func (m *model) applyKeepMarks(branches []branch, reads repoReads) {
+	m.applyBranches(carryMarks(m.branches, branches), reads)
+}
+
+// installBranches is applyBranches without the merge queries, which cost a
+// round of git. startupModel runs them in the background instead.
+func (m *model) installBranches(branches []branch, reads repoReads) {
+	// Read the cursor's branch from the old list, before it is replaced: after,
+	// the cursor index points into an unsorted new list.
+	focus := ""
+	if b := m.cur(); b != nil {
+		focus = b.name
 	}
+	m.loadGen++
+	m.merging = false
+	m.config = reads.config
+	m.branches = append(branches, remoteOnlyRows(branches, reads.remotes.rows)...)
+	m.recomputeNameWidth()
+	m.resolveBases(reads)
+	for i := range m.branches {
+		b := &m.branches[i]
+		b.headMerged = !b.remoteOnly && reads.headMerged[b.name]
+		b.protected = m.isProtected(*b)
+		if b.locked() {
+			b.selected, b.deleteRemote = false, false
+		}
+	}
+	m.sortRows()
+	m.cursor = 0
+	m.focusBranch(focus)
+	m.clampCursor()
 }
 
-// hasBranch reports whether the loaded list holds a local branch of that name.
-func (m model) hasBranch(name string) bool {
-	for _, b := range m.branches {
-		if b.name == name {
+// remoteOnlyRows keeps the remote rows that no local branch tracks.
+func remoteOnlyRows(local, remote []branch) []branch {
+	tracked := make(map[string]bool, len(local))
+	for _, b := range local {
+		tracked[b.upstream] = true
+	}
+	var out []branch
+	for _, r := range remote {
+		if !tracked[r.name] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// isProtected reports whether b is the trunk or matches a pruner.protect glob.
+// A remote row is matched by its branch part, so "release/*" covers both views.
+func (m model) isProtected(b branch) bool {
+	name := b.name
+	if b.remoteOnly {
+		if b.name == m.remoteDefault {
+			return true
+		}
+		name = b.remoteBranch()
+	} else if _, trunk, ok := strings.Cut(m.remoteDefault, "/"); b.ref() == m.riskBaseRef || (ok && name == trunk) {
+		return true
+	}
+	for _, p := range m.config.protect {
+		if ok, _ := path.Match(p, name); ok {
 			return true
 		}
 	}
 	return false
 }
 
-// refreshMergeInfo caches the remote default branch, marks each branch whose
-// upstream is merged into it or whose tip is merged into HEAD, and measures what
-// deleting it would cost. Call after every branch (re)load, passing the reads
-// that came back with it.
-func (m *model) refreshMergeInfo(reads repoReads) {
-	defRef := remoteDefaultFrom(reads.remotes)
+// reloadBranches refreshes the branch list from git and resets the view to the
+// top — appropriate after a mutation that may have removed the cursor's branch.
+func (m *model) reloadBranches() {
+	if branches, reads, err := loadRepo(m.remoteLoaded); err == nil {
+		m.applyBranches(branches, reads)
+		m.cursor, m.top = 0, 0
+	}
+}
 
-	m.riskBaseRef = defRef
+// hasBranch reports whether the loaded list holds a local branch of that name.
+func (m model) hasBranch(name string) bool {
+	for _, b := range m.branches {
+		if b.name == name && !b.remoteOnly {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveBases finds the remote default and the risk base. It needs no git
+// call: the refs came with the load, and the local fallback is a lookup.
+// The refs drive git; the short forms are what the views print.
+func (m *model) resolveBases(reads repoReads) {
+	m.remoteDefaultRef = remoteDefaultFrom(reads.remotes)
+	m.riskBaseRef = m.remoteDefaultRef
 	if m.riskBaseRef == "" {
-		// The branch list is already loaded, so this candidate check is a lookup
-		// rather than a subprocess per name.
 		m.riskBaseRef = localDefaultBranch("", m.hasBranch)
 	}
-	// The refs drive git; the short forms are what the views print.
-	m.remoteDefault = shortRef(defRef)
+	m.remoteDefault = shortRef(m.remoteDefaultRef)
 	m.riskBase = shortRef(m.riskBaseRef)
+}
 
-	// Round two. Neither query needs the other's answer, and each is a
-	// subprocess start, so they go together.
-	var merged map[string]bool
+// goneRefs lists the refs of the gone branches. Only these are measured up
+// front, because `p` consults the count to decide what it may auto-select. The
+// rest wait for measureSelectedRisk: riskCommitCount is a subprocess per branch,
+// and measuring every unmergeable branch here would put a network-free repo's
+// whole branch list on the clock.
+func (m model) goneRefs() []string {
+	var out []string
+	for _, b := range m.branches {
+		if b.gone {
+			out = append(out, b.ref())
+		}
+	}
+	return out
+}
+
+// mergeQuery captures the merge queries' inputs now and returns the call. The
+// inputs are read here, on the update loop, so a goroutine running the call
+// never reads the branch list while Update changes it.
+func (m model) mergeQuery() func() mergeInfo {
+	defRef, baseRef, gone := m.remoteDefaultRef, m.riskBaseRef, m.goneRefs()
+	return func() mergeInfo { return queryMergeInfo(defRef, baseRef, gone) }
+}
+
+// queryMergeInfo runs the merge queries. It reads no model state, so it can run
+// in a tea.Cmd. Neither query needs the other's answer, and each is a
+// subprocess start, so they go together.
+func queryMergeInfo(defRef, baseRef string, gone []string) mergeInfo {
+	var info mergeInfo
 	remote := make(chan struct{})
 	go func() {
-		merged = remoteMergedSet(defRef)
+		info.remoteMerged = remoteMergedSet(defRef)
 		close(remote)
 	}()
 	// One query answers "is this branch's tip already in the base?" for the whole
 	// list, which is the answer for most branches a prune touches.
-	m.baseMerged = nil
-	if m.riskBaseRef != "" {
-		m.baseMerged = mergedSet("branch", "--merged", m.riskBaseRef)
+	if baseRef != "" {
+		info.baseMerged = mergedSet("branch", "--merged", baseRef)
 	}
 	<-remote
 
+	var todo []string
+	info.risk = map[string]int{}
+	for _, ref := range gone {
+		if info.baseMerged[shortRef(ref)] {
+			info.risk[ref] = 0
+		} else {
+			todo = append(todo, ref)
+		}
+	}
+	for i, n := range countRisk(todo, baseRef) {
+		info.risk[todo[i]] = n
+	}
+	return info
+}
+
+// applyMergeInfo writes the merge query results onto the branches.
+func (m *model) applyMergeInfo(info mergeInfo) {
+	m.merging = false
+	m.baseMerged = info.baseMerged
 	for i := range m.branches {
 		b := &m.branches[i]
-		b.remoteMerged = b.upstream != "" && merged[b.upstream]
-		b.headMerged = reads.headMerged[b.name]
+		b.remoteMerged = b.upstream != "" && info.remoteMerged[b.upstream]
 		b.riskMeasured = false // the branch was just reloaded; any old count is stale
+		if n, ok := info.risk[b.ref()]; ok {
+			b.riskCommits, b.riskMeasured = n, true
+		}
 	}
-	// Only gone branches are measured up front, because `p` consults the count to
-	// decide what it may auto-select. The rest wait for measureSelectedRisk:
-	// riskCommitCount is a subprocess per branch, and measuring every unmergeable
-	// branch here would put a network-free repo's whole branch list on the clock.
-	m.measureRisk(func(b branch) bool { return b.gone })
+}
+
+// inBase reports whether b's tip is already in the risk base, from the merge
+// queries alone. Such a branch has an empty base..branch range, so `git cherry`
+// would report nothing.
+func (m model) inBase(b branch) bool {
+	// A remote row is only measured when it is not merged (see
+	// measureSelectedRisk), so the local set is the only one worth asking.
+	return !b.remoteOnly && m.baseMerged[b.name]
+}
+
+// countRisk runs riskCommitCountRef for each ref. The counts are independent
+// `git cherry` subprocesses whose cost is dominated by process spawn, so they
+// run concurrently: measured one at a time, a repo with a hundred gone branches
+// spent 1.1s here on every load, fetch and prune.
+func countRisk(refs []string, base string) []int {
+	out := make([]int, len(refs))
+	var wg sync.WaitGroup
+	for i, ref := range refs {
+		// Each goroutine owns one slice element, so no two write the same one.
+		wg.Go(func() { out[i] = riskCommitCountRef(ref, base) })
+	}
+	wg.Wait()
+	return out
 }
 
 // measureRisk fills in the cost-of-deletion count for every not-yet-measured
-// branch that want accepts. The counts are independent `git cherry` subprocesses
-// whose cost is dominated by process spawn, so they run concurrently: measured
-// one at a time, a repo with a hundred gone branches spent 1.1s here on every
-// load, fetch and prune.
+// branch that want accepts.
 func (m *model) measureRisk(want func(branch) bool) {
-	base := m.riskBaseRef // read once: the goroutines must not touch the model
-	var wg sync.WaitGroup
-	for i := range m.branches {
-		if m.branches[i].riskMeasured || !want(m.branches[i]) {
+	var idx []int
+	var refs []string
+	for i, b := range m.branches {
+		if b.riskMeasured || !want(b) {
 			continue
 		}
-		// A branch already contained in the base has an empty base..branch range,
-		// so `git cherry` would report nothing. Answer from the set instead of
-		// spawning the subprocess.
-		if m.baseMerged[m.branches[i].name] {
-			m.branches[i].riskCommits = 0
-			m.branches[i].riskMeasured = true
+		// Answer from the merge sets instead of spawning the subprocess.
+		if m.inBase(b) {
+			m.branches[i].riskCommits, m.branches[i].riskMeasured = 0, true
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// Each goroutine owns one slice element, so no two write the same branch.
-			m.branches[i].riskCommits = riskCommitCount(m.branches[i].name, base)
-			m.branches[i].riskMeasured = true
-		}()
+		idx = append(idx, i)
+		refs = append(refs, b.ref())
 	}
-	wg.Wait()
+	for k, n := range countRisk(refs, m.riskBaseRef) {
+		m.branches[idx[k]].riskCommits, m.branches[idx[k]].riskMeasured = n, true
+	}
 }
 
 // measureSelectedRisk measures what deleting each selected branch would cost.
 // Call before any view that reports the cost: only branches a safe delete would
-// refuse are measured, since those are the ones deleted with -D.
+// refuse are measured, since those are the ones deleted with -D. A remote
+// branch not merged into the default is measured too: deleting it can take the
+// only shared copy of its commits.
 func (m *model) measureSelectedRisk() {
-	m.measureRisk(func(b branch) bool { return b.selected && (b.gone || !b.safeDeletable()) })
+	m.measureRisk(func(b branch) bool {
+		return b.selected && (b.gone || !b.safeDeletable() || (b.remoteOnly && !b.remoteMerged))
+	})
 }
 
 // forceDeleteUnmerged re-runs the deletions that a safe (-d) delete refused,
@@ -811,6 +1212,70 @@ func (m *model) forceDeleteUnmerged() {
 	m.reloadBranches()
 }
 
+// undoDoneMsg carries a background undo and the reload after it.
+type undoDoneMsg struct {
+	restored []int // indices into m.results
+	errs     []string
+	branches []branch
+	reads    repoReads
+	loadErr  error
+}
+
+// undo recreates the local branches the last run deleted, at the commits they
+// pointed to, with their upstream config. It runs as a tea.Cmd: each branch is
+// up to three git calls, and a wide prune would freeze the screen for seconds.
+// The calls stay serial because parallel `git config` writes collide on
+// .git/config.lock. A remote branch cannot come back this way: that would be a
+// push, so the exit summary prints the command instead.
+func (m *model) undo() tea.Cmd {
+	var todo []int
+	for i, r := range m.results {
+		if r.restorable() {
+			todo = append(todo, i)
+		}
+	}
+	m.state = stateList
+	if len(todo) == 0 {
+		m.status = "nothing to undo"
+		return nil
+	}
+	m.status = "restoring…"
+	results, withRemote := slices.Clone(m.results), m.remoteLoaded
+	return func() tea.Msg {
+		var msg undoDoneMsg
+		for _, i := range todo {
+			if err := restoreBranch(results[i].br); err != nil {
+				msg.errs = append(msg.errs, results[i].br.name+": "+err.Error())
+			} else {
+				msg.restored = append(msg.restored, i)
+			}
+		}
+		msg.branches, msg.reads, msg.loadErr = loadRepo(withRemote)
+		return msg
+	}
+}
+
+// applyUndo records a finished undo and installs the reload that came with it.
+func (m *model) applyUndo(msg undoDoneMsg) {
+	remote := 0
+	for _, i := range msg.restored {
+		m.results[i].restored = true
+	}
+	for _, r := range m.results {
+		if r.remoteOK {
+			remote++
+		}
+	}
+	if msg.loadErr == nil {
+		m.applyKeepMarks(msg.branches, msg.reads)
+	}
+	m.err = strings.Join(msg.errs, "; ")
+	m.status = fmt.Sprintf("restored %d branch(es)", len(msg.restored))
+	if remote > 0 {
+		m.status += fmt.Sprintf(" · %d remote branch(es) not restored — see the commands printed on quit", remote)
+	}
+}
+
 // selectGone selects every gone branch that carries nothing missing from the
 // base and reports the outcome for the status line. Branches holding unique
 // commits stay unselected so discarding them is a deliberate keystroke rather
@@ -819,7 +1284,7 @@ func (m *model) selectGone() string {
 	gone, risky := 0, 0
 	for i := range m.branches {
 		br := &m.branches[i]
-		if !br.gone || br.isCurrent {
+		if !br.gone || br.locked() {
 			continue
 		}
 		gone++
@@ -838,4 +1303,32 @@ func (m *model) selectGone() string {
 		return fmt.Sprintf("%d of %d gone branch(es) selected; %d hold commits not in %s (select with space to discard)",
 			gone-risky, gone, risky, m.riskBase)
 	}
+}
+
+// merged reports whether b's work is already in the default branch. A local
+// branch ahead of its upstream holds commits the upstream check cannot see, so
+// it only counts when its own tip is in the base.
+func (m model) merged(b branch) bool {
+	if b.remoteOnly {
+		return b.remoteMerged
+	}
+	return m.baseMerged[b.name] || (b.remoteMerged && b.ahead == 0)
+}
+
+// selectMergedOlder selects the listed branches that are merged and whose last
+// commit is older than days. It acts on the listed rows only, like `a`.
+func (m *model) selectMergedOlder(days int, now time.Time) string {
+	cutoff := now.AddDate(0, 0, -days)
+	n := 0
+	for _, i := range m.viewIdx() {
+		b := &m.branches[i]
+		if b.locked() || !m.merged(*b) || !b.committed.Before(cutoff) {
+			continue
+		}
+		if !b.selected {
+			b.selected = true
+			n++
+		}
+	}
+	return fmt.Sprintf("selected %d merged branch(es) older than %d days", n, days)
 }
