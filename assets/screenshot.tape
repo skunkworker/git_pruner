@@ -14,7 +14,7 @@ Source "assets/common.tape"
 Type "git_pruner"
 Enter
 Sleep 3s
-# `g` first: on launch the cursor sits on whatever branch git listed first.
+# `g` is kept for older builds, where the cursor did not start on the first row.
 Type "g"
 Sleep 300ms
 Type "jjj"

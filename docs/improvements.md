@@ -204,71 +204,70 @@ The 501-branch case is `for-each-ref`'s own work (42ms of the 77ms), not chain d
 
 ---
 
-## Remaining work
+### 2026-09-23 pass (all of the remaining roadmap, plus new work)
 
-### Tier 2 — robustness
+**5. First paint no longer waits on the merge queries.** `startupModel` paints after round one;
+`Init` runs `queryMergeInfo` (round two plus the gone-branch `git cherry` calls) as a `tea.Cmd`.
+The result carries `loadGen`, so a reply for a list that was reloaded since is dropped. Until it
+lands, `x`, `m` and `d` wait with a status line: selecting on unknown merge state is the one
+thing that must not happen. Every other reload path stays synchronous (it is ~16ms), which keeps
+one async path instead of a pending-action queue behind `p`. `initialModel` keeps the old
+synchronous behavior for script mode and the tests. `v` now also loads its diff (and re-runs
+delta on resize) in a `tea.Cmd`, with `diffSeq` dropping stale answers.
 
-**5. Blocking git calls inside `Update`.** `loadDiff` (`v`), `refreshMergeInfo` and
-`reloadBranches` still run synchronously in the update loop, so what remains of their cost is
-still a freeze. Items 14, 16 and 18 under Completed took the residue to ~16ms on a
-100-gone-branch repo, so this is no longer a visible freeze — what it would still buy is the
-first paint, which currently waits on the whole two-round load. Moving `refreshMergeInfo` onto
-the `tea.Cmd` pattern already used for fetch would put the branch list on screen after one
-subprocess (~7ms) and fill the ✓ and risk columns in behind it.
+**6. Network calls are bounded.** `runGit` sets `GIT_TERMINAL_PROMPT=0`, starts `push`/`fetch`
+in a new session (`Setsid`, so ssh has no `/dev/tty` to prompt on), and kills them after
+`netTimeout` (60s) with `WaitDelay` for an ssh child still holding the pipes. Tested with a fake
+`git` on `PATH` that sleeps, because the `ext::` transport needs a config override.
 
-Do not reach for `git branch -r --merged` first: it was measured at 100ms with 2000 remote
-refs, roughly a tenth of what the `git cherry` loop beside it cost.
+**8. Smaller items — all fixed.**
+- Rows fit the terminal: `rowLayout` drops the relative date, then the hash, then the date until
+  a 10-cell subject fits, then shrinks the name; a final `ansi.Truncate` guards the rest. The
+  header, help, status and error lines are cut to the width too, and `visibleRows` counts the
+  status and error lines (`TestListViewFitsHeight` checks the exact height).
+- Subjects and git error text pass through `cleanText` (ANSI strip, control characters out);
+  raw diff lines too, with tabs widened first. Branch names cannot hold control characters
+  (`check-ref-format`), so they need nothing.
+- The cursor starts on row 0: `installBranches` reads the focused name from the *old* list.
+- A clean gone branch shows `✓ no commits missing from <base>` instead of `⚠ not merged`.
+- ctrl+c while deleting needs a second press, with an on-screen warning.
 
-**6. `runGit` has no timeout and does not disable terminal prompts.** `fetch --all --prune` and
-`push --delete` are network-bound; a credential or SSH prompt hangs the TUI with no recovery.
-Set `GIT_TERMINAL_PROMPT=0` and attach a `context.WithTimeout` so it fails fast instead.
+**10. `m`: merged and older than N days.** Prompt starts at `pruner.staleDays` (default 90).
+Merged means tip in the base, or upstream merged with `ahead == 0` — a branch ahead of its merged
+upstream holds work the upstream check cannot see.
 
-**8. Smaller items.**
-- Rows are wider than the terminal whenever `subjectWidth` hits its `max(10, …)` floor, and each
-  wrapped row eats two screen lines while `visibleRows` still counts it as one — so the list
-  overruns and the footer scrolls away. Measured threshold: rows wrap below `68 + nameW` columns,
-  which at a classic 80-column terminal means any branch name of 13 cells or more wraps *every*
-  row. `renderRow` needs to fit `m.width` rather than assume it.
-- `listView` runs one line over terminal height when `status` and `err` are both set
-  (`visibleRows` is `height-5`; actual emission is `height+1`) — confirmed at 25 lines for a
-  height of 24.
-- ANSI and control characters in commit subjects and branch names render raw into the terminal.
-  Confirmed: a `\x1b[31m` in a subject reaches the row intact (a bare `BEL` is stripped by
-  `ansi.Truncate`). The text comes from fetched branches, so it is not the author's to trust.
-- The cursor starts on an arbitrary row. `sortBranches` preserves the cursor by name
-  unconditionally, but at startup `cursor` is 0 and `branches` is still in `for-each-ref`
-  (alphabetical) order, so it pins the cursor to wherever the alphabetically-first branch
-  lands after sorting — row 10 of 11 on the demo repo. Skip the preserve when there is no
-  prior cursor to restore.
-- The confirmation screen warns `⚠ not merged into <default>` for every gone branch, because
-  `remoteMerged` tests the upstream ref and a gone branch no longer has one. Branches that were
-  merged and pushed before their upstream was deleted are flagged as if they held unique work;
-  `riskWarning` already reports the real cost correctly.
-- `stateDeleting`'s ctrl+c quits while `git push --delete` children are still running.
+**11. Undo and recovery hints.** `u` (results screen or list) recreates the last run's local
+branches at their full SHA and restores `branch.<name>.remote/.merge` from
+`%(upstream:remotename)`/`%(upstream:remoteref)`, read in the existing `for-each-ref`. Remote
+deletions are not undone (that would be a push); instead the exit summary prints
+`git push <remote> <sha>:refs/heads/<b>`. The results screen no longer quits on `enter`. Undo runs as a `tea.Cmd`, serially: parallel
+`git config` writes would collide on `.git/config.lock`.
 
-### Tier 3 — features for the tool's actual job
+A later `/simplify` pass also debounced delta on resize (100ms), so a window drag runs it once.
+It left two findings on purpose: dropping the test-only `riskCommitCount`/`loadDiff` wrappers
+(churn in a dozen tests for no behavior change), and keying the merge sets by full ref (it only
+matters for a local branch literally named like a remote one, e.g. `origin/x`).
 
-**9. `/` incremental filter.** ✅ Done (2026-08-31). Case-insensitive substring filter over
-branch names; `enter` keeps it, `esc` clears it, and `a` selects only the listed rows. The
-cursor and scroll offsets are positions in the filtered view (`viewIdx`); marks stay on the
-branch structs, so hidden rows keep theirs.
+**12. `main.go` split** into `git.go`, `model.go`, `view.go`, `cli.go`, `settings.go`,
+`proc_*.go` by an AST script — no hand edits in the move. **13.** `BINDIR` was already
+overridable; the Makefile now rebuilds on any `*.go` change.
 
-**9b. `c` branch checkout (was `b`).** ✅ Done (2026-08-31). `git switch` on the cursor row — it resolves
-branch names only, so the tag-shadowing rule holds without qualification. Part of a deliberate
-shift toward a general interactive branch tool, not just pruning.
+**New: locked branches.** `branch.locked()` = current, checked out in another worktree
+(`%(worktreepath)`, shown `+` like `git branch`), or protected (the trunk plus `pruner.protect`
+globs, shown `P`). Locked rows cannot be marked by any key, and `selectedBranches` drops them as a
+second guard.
 
-**10. Bulk-select predicates** (merged, older than N days). "Select everything merged and older
-than 90 days" is the canonical prune workflow and currently has to be done by hand.
+**New: remote-only view (`tab`).** Remote branches no local branch tracks, as rows in the same
+slice with `remoteOnly` set; `viewIdx` filters by mode, so marks survive a view switch like they
+survive a filter. The rows are read lazily (`loadRemoteRefs(true)`) on first `tab`, then kept on
+every reload. Deleting them is `R` only; `c` runs `git switch -c <b> --track refs/remotes/…`
+(the full ref, so a same-named tag cannot shadow it).
 
-**11. Reflog recovery hint after a `-D`.** The force-prompt screen says "permanently discard their
-unmerged commits" without telling the user that `git reflog` can still recover them. Pairs
-naturally with finding 1.
+**New: script mode** (`--prune-gone`, `--merged-older-than`, `--fetch`, `--yes`, `--dry-run`).
+Lists unless `--yes`; never deletes remotes.
 
-### Tier 4 — hygiene
-
-**12. Split `main.go`** (~1,300 lines) into `git.go` / `model.go` / `view.go`.
-
-**13. Make the Makefile's `BINDIR` overridable** — it hardcodes `$HOME/shared/bin`.
+**New: sort memory** in `os.UserConfigDir()/git_pruner/settings`; `settingsPath` stays empty
+under test.
 
 ### Reviewed and deferred (2026-08-31 /simplify pass)
 
