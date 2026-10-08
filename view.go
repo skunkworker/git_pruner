@@ -546,8 +546,8 @@ func (m model) helpView() string {
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("Gone branches are deleted with -D. Any holding commits that are not in\n" +
 		"the default branch are left unselected by x/p and flagged on the confirm screen.\n" +
-		"A branch in a linked worktree is deleted after its worktree is removed; safe mode\n" +
-		"refuses a worktree with uncommitted changes, force mode discards them.\n" +
+		"A branch in a linked worktree is deleted after its worktree is removed, with\n" +
+		"everything in it.\n" +
 		"Protect more branches with: git config --add pruner.protect 'release/*'"))
 	b.WriteString("\n\n")
 
@@ -639,19 +639,16 @@ func (m model) confirmView() string { return m.page(m.confirmParts()) }
 
 // worktreeWarning states what deleting br does to the worktree that holds it,
 // or "" when no worktree does. git refuses to delete a branch a worktree has
-// checked out, so the worktree is removed first. git also deletes the
-// worktree's ignored files, such as .env, which it never counts as changes.
+// checked out, so the worktree is removed first, with everything in it.
 func (m model) worktreeWarning(br branch) string {
 	switch {
 	case br.worktree == "":
 		return ""
-	case m.force:
-		return "+ remove worktree " + br.worktree + " (uncommitted and ignored files will be lost)"
-	case br.safeDeleteRefuses(false):
+	case br.safeDeleteRefuses(m.force):
 		// The worktree stays until the force retry.
 		return "+ remove worktree " + br.worktree + " if you then force delete"
 	default:
-		return "+ remove worktree " + br.worktree + " (refused if it has uncommitted changes; ignored files will be lost)"
+		return "+ remove worktree " + br.worktree + " and everything in it"
 	}
 }
 

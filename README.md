@@ -178,19 +178,18 @@ claiming the work is unrecoverable.
 ## Branches checked out in a worktree
 
 git refuses to delete a branch that any worktree has checked out, even with `-D`. git_pruner
-marks such a branch with `+` and runs `git worktree remove` before it deletes the branch. The
-confirmation screen names each worktree it will remove.
+marks such a branch with `+` and runs `git worktree remove --force` before it deletes the
+branch. The confirmation screen names each worktree it will remove.
 
-- In safe mode, git refuses to remove a worktree with uncommitted changes or untracked files,
-  and the branch stays. Force mode (`f`) removes the worktree with `--force` and discards them.
-- A worktree whose directory is already gone is removed in either mode.
+- A worktree is scratch space for its branch. The remove deletes the worktree folder and
+  everything in it, uncommitted changes included, in safe and force mode alike.
+- A worktree whose folder is already gone is removed too.
 - If the safe delete (`-d`) would refuse the branch as not fully merged, the worktree stays
-  until you accept the force delete prompt.
-- git also deletes the worktree's ignored files, such as `.env`, in both modes. git does not
-  count them as changes, so the confirmation screen warns about them.
+  until you accept the force delete prompt. The branch's commits are the work at risk there.
+- git refuses to remove a locked worktree (`git worktree lock`), and the branch stays.
 - A branch checked out in the main worktree is locked: git cannot remove the main worktree.
   This happens when you run git_pruner from a linked worktree.
-- Script mode removes worktrees the same way as safe mode.
+- Script mode removes worktrees the same way.
 
 ## Selecting merged, old branches
 

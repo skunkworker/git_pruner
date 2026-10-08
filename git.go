@@ -631,8 +631,8 @@ func (b branch) deleteFlag(force bool) string {
 
 // deleteBranch runs one branch's local delete and, when wantRemote is set, its
 // remote-branch push --delete. It is the worker deleteBranchCmd runs off the
-// update loop, one cmd per branch. force is the user's force mode: it picks the
-// delete flag and lets a worktree with uncommitted changes be removed.
+// update loop, one cmd per branch. force is the user's force mode, which picks
+// the delete flag.
 func deleteBranch(b branch, force, wantRemote bool) deleteResult {
 	res := deleteResult{br: b, done: true}
 	if b.remoteOnly {
@@ -650,7 +650,7 @@ func deleteBranch(b branch, force, wantRemote bool) deleteResult {
 		// The worktree stays until the user agrees to that retry.
 		res.localErr = "not fully merged (worktree kept)"
 		res.forceable = true
-	case b.worktree != "" && !removeWorktree(&res, force):
+	case b.worktree != "" && !removeWorktree(&res):
 	default:
 		if _, err := runGit("branch", flag, b.name); err != nil {
 			res.localErr = err.Error()
@@ -676,16 +676,12 @@ func deleteBranch(b branch, force, wantRemote bool) deleteResult {
 }
 
 // removeWorktree removes the linked worktree holding res's branch: git refuses to
-// delete a branch any worktree has checked out, under -d and -D alike. Without
-// force, git refuses a worktree with uncommitted changes or untracked files;
-// with it, they are discarded. A worktree whose directory is already gone is
-// removed either way. It reports whether the branch is now free to delete.
-func removeWorktree(res *deleteResult, force bool) bool {
-	args := []string{"worktree", "remove"}
-	if force {
-		args = append(args, "--force")
-	}
-	if _, err := runGit(append(args, res.br.worktree)...); err != nil {
+// delete a branch any worktree has checked out, under -d and -D alike. A
+// worktree is scratch space for its branch, so it goes with everything in it,
+// uncommitted changes included. A locked worktree is refused: someone locked it
+// on purpose. It reports whether the branch is now free to delete.
+func removeWorktree(res *deleteResult) bool {
+	if _, err := runGit("worktree", "remove", "--force", res.br.worktree); err != nil {
 		res.localErr = "worktree " + res.br.worktree + ": " + cleanText(err.Error())
 		return false
 	}

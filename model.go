@@ -1206,7 +1206,7 @@ func (m *model) forceDeleteUnmerged() {
 		}
 		// deleteBranch kept the worktree while -d was going to refuse the
 		// branch; the user has now agreed to the delete, so free it.
-		if r.worktreePending() && !removeWorktree(r, m.force) {
+		if r.worktreePending() && !removeWorktree(r) {
 			continue
 		}
 		if _, err := runGit("branch", "-D", r.br.name); err != nil {

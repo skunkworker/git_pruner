@@ -1387,13 +1387,11 @@ func TestNonUnmergedFailureIsNotForceable(t *testing.T) {
 	repo := setupRepo(t)
 	chdir(t, repo)
 
-	// A second worktree holds the merged branch and an untracked file, so a
-	// safe delete must refuse to remove the worktree, and with it the branch.
+	// A locked worktree holds the merged branch: git refuses to remove it, so
+	// the branch cannot be freed under -d or -D.
 	wt := t.TempDir() + "/wt"
 	git(t, repo, "worktree", "add", "-q", wt, "feature/merged")
-	if err := os.WriteFile(wt+"/scratch", []byte("unsaved work"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	git(t, repo, "worktree", "lock", wt)
 
 	m, err := initialModel()
 	if err != nil {
@@ -1405,7 +1403,7 @@ func TestNonUnmergedFailureIsNotForceable(t *testing.T) {
 		t.Fatalf("delete should have failed: %+v", res)
 	}
 	if res.forceable {
-		t.Fatalf("a dirty worktree must not be offered as force-retryable: %q", res.localErr)
+		t.Fatalf("a locked worktree must not be offered as force-retryable: %q", res.localErr)
 	}
 
 	// End to end: the async path lands on the results screen, not the prompt.
@@ -2881,14 +2879,17 @@ func TestWorktreeBranchDeletes(t *testing.T) {
 	}
 }
 
-// A worktree with uncommitted work survives a safe delete, and the branch with
-// it; force mode is the user's say-so to discard that work.
-func TestDirtyWorktreeNeedsForce(t *testing.T) {
+// A worktree is scratch space for its branch: even a safe delete removes it
+// with everything in it, changed and untracked files included.
+func TestDirtyWorktreeIsRemoved(t *testing.T) {
 	repo := setupLocalRepo(t)
 	chdir(t, repo)
 	wt := filepath.Join(realTempDir(t), "wt")
 	git(t, repo, "worktree", "add", "-q", wt, "feature/merged")
-	if err := os.WriteFile(filepath.Join(wt, "scratch"), []byte("unsaved work"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(wt, "a"), []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "scratch"), []byte("untracked"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2898,30 +2899,17 @@ func TestDirtyWorktreeNeedsForce(t *testing.T) {
 	}
 	find(m.branches, "feature/merged").selected = true
 	m.force = false
-	if body := strings.Join(m.confirmBody(), "\n"); !strings.Contains(body, "remove worktree "+wt+" (refused if it has uncommitted changes; ignored files will be lost)") {
-		t.Fatalf("the safe confirm must say the worktree goes only if clean:\n%s", body)
+	if body := strings.Join(m.confirmBody(), "\n"); !strings.Contains(body, "remove worktree "+wt+" and everything in it") {
+		t.Fatalf("the confirm must say the worktree goes with its contents:\n%s", body)
 	}
 	m = startAndDrain(t, m, false)
 
-	wantState(t, m, stateResult, "a dirty worktree is not a force-prompt case")
-	if r := result(t, m, "feature/merged"); r.localOK || r.worktreeRemoved || !strings.Contains(r.localErr, wt) {
-		t.Fatalf("safe mode must refuse the dirty worktree and name it: %+v", r)
-	}
-	if !dirExists(filepath.Join(wt, "scratch")) || find(m.branches, "feature/merged") == nil {
-		t.Fatal("the worktree, its files and the branch must all survive a refused delete")
-	}
-
-	find(m.branches, "feature/merged").selected = true
-	m.force = true
-	if body := strings.Join(m.confirmBody(), "\n"); !strings.Contains(body, "uncommitted and ignored files will be lost") {
-		t.Fatalf("the force confirm must warn that changes are discarded:\n%s", body)
-	}
-	m = startAndDrain(t, m, false)
+	wantState(t, m, stateResult, "a dirty worktree is removed, not refused")
 	if r := result(t, m, "feature/merged"); !r.localOK || !r.worktreeRemoved {
-		t.Fatalf("force mode should remove the dirty worktree and the branch: %+v", r)
+		t.Fatalf("safe mode should remove the dirty worktree and the branch: %+v", r)
 	}
-	if dirExists(wt) {
-		t.Fatal("the worktree directory should be removed under force")
+	if dirExists(wt) || find(m.branches, "feature/merged") != nil {
+		t.Fatal("the worktree and the branch should both be gone")
 	}
 }
 
