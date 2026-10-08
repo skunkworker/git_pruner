@@ -45,9 +45,11 @@ git_pruner version     # also --version, -v
 | -------------- | ------------------------------------------------------------- |
 | `↑`/`k`, `↓`/`j` | Move cursor                                                 |
 | `g` / `G`      | Jump to top / bottom                                          |
-| `space`        | Toggle selection (the current branch, and a branch checked out in the main worktree, cannot be selected) |
+| `space`        | Toggle selection (locked branches cannot be selected — see [Protected branches](#protected-branches)) |
 | `a` / `n`      | Select all listed branches / clear selection                 |
-| `c`            | Checkout the branch under the cursor (`git switch`)           |
+| `m`            | Select listed branches that are merged and older than N days (prompts for N) |
+| `tab`          | Switch between local branches and [remote-only branches](#remote-only-branches) |
+| `c`            | Checkout the branch under the cursor (`git switch`); on a remote-only row, create a local branch that tracks it |
 | `/`            | Filter branches by name; `enter` keeps it, `esc` clears it    |
 | `r`            | Toggle "also delete remote" for the row (needs an upstream)   |
 | `v`            | View the branch's diff (through [delta](https://github.com/dandavison/delta) when installed) |
@@ -56,6 +58,7 @@ git_pruner version     # also --version, -v
 | `s`            | Cycle sort field: committerdate -> name -> ahead/behind       |
 | `o`            | Reverse sort direction                                        |
 | `f`            | Toggle delete mode: safe `-d` <-> force `-D`                  |
+| `u`            | Undo: recreate the local branches the last delete removed     |
 | `d` / `enter`  | Go to the confirmation screen                                 |
 | `?`            | Help screen (build metadata, keybindings, column guide)       |
 | `q` / `ctrl+c` | Quit                                                          |
@@ -68,7 +71,19 @@ delete (`-d`) because it isn't fully merged, a follow-up prompt offers to force 
 just those branches — `y` discards their unmerged commits, `n`/`esc` keeps them.
 
 Deletions run in the background with a live progress screen (a spinner plus a per-branch
-checklist), so the UI stays responsive while remote pushes complete.
+checklist), so the UI stays responsive while remote pushes complete. `ctrl+c` there asks for a
+second press: quitting mid-run can leave a remote branch behind a deleted local one.
+
+On the results screen, `u` recreates the deleted local branches at their old commits, with
+their upstream config. `enter` returns to the list, and `q` quits. When you quit, git_pruner
+prints a restore command for every branch it deleted this session, so the way back stays in your
+scrollback:
+
+```
+git_pruner: to restore a deleted branch, run:
+  git branch feature/foo 3e2210a…
+  git push origin 3e2210a…:refs/heads/feature/foo
+```
 
 In the diff view: `↑`/`↓` scroll, `space`/`ctrl+d` page down, `ctrl+u`/`pgup` page up,
 `g`/`G` jump to top/bottom, and `q`/`esc`/`v` return to the list.
@@ -85,12 +100,14 @@ precedence, so `y`, `R` and `n` still work while a list is scrolled.
 > [x] R *  feature/foo        ↑2↓1 ✓  3 days ago   a1b2c3d  Fix the thing
 ```
 
-- `>` cursor, `[x]` selected, `R` remote deletion armed, `*` current branch, `+` checked out in
-  another worktree
+- `>` cursor, `[x]` selected, `R` remote deletion armed
+- `*` current branch and `P` protected are locked; `+` checked out in another worktree (see
+  [Branches checked out in a worktree](#branches-checked-out-in-a-worktree))
 - ahead/behind shown as `↑N↓M` (`=` when in sync, `gone` in red when the upstream was deleted)
 - a green `✓` after the track column means the upstream is merged into the remote default
   branch — i.e. the remote is safe to delete
-- relative commit date, short hash, and commit subject
+- relative commit date, short hash, and commit subject. On a narrow terminal the relative date,
+  then the hash, then the date drop out, so a row never wraps
 
 ## Viewing a branch's changes
 
@@ -169,13 +186,72 @@ confirmation screen names each worktree it will remove.
 - A worktree whose directory is already gone is removed in either mode.
 - If the safe delete (`-d`) would refuse the branch as not fully merged, the worktree stays
   until you accept the force delete prompt.
-- A branch checked out in the main worktree cannot be selected: git cannot remove the main
-  worktree. This happens when you run git_pruner from a linked worktree.
+- git also deletes the worktree's ignored files, such as `.env`, in both modes. git does not
+  count them as changes, so the confirmation screen warns about them.
+- A branch checked out in the main worktree is locked: git cannot remove the main worktree.
+  This happens when you run git_pruner from a linked worktree.
+- Script mode removes worktrees the same way as safe mode.
+
+## Selecting merged, old branches
+
+Press `m`, type an age in days (it starts at 90, or at `pruner.staleDays`), and press `enter`.
+git_pruner selects every listed branch that is merged into the default branch and whose last
+commit is older than that. A local branch counts as merged when its tip is in the default
+branch, or when its upstream is merged and it has no commits of its own on top. Like `a`, it only
+acts on the listed rows, so a `/` filter narrows it.
+
+## Remote-only branches
+
+Press `tab` to list the remote branches that no local branch tracks — work other people pushed,
+or branches you deleted locally but not on the remote. They are read on first use, so startup
+does not pay for them. A `✓` means the branch is merged into the remote default; the
+confirmation screen counts the commits of any branch that is not.
+
+Deleting one is a push, so only `R` does it; `y` never touches a remote. The exit summary
+prints the `git push` command that puts a deleted remote branch back.
+
+## Protected branches
+
+The default branch is always protected. Add your own with name globs:
+
+```sh
+git config --add pruner.protect 'release/*'
+git config --add pruner.protect develop
+```
+
+A protected branch shows `P` and cannot be selected by any key. Remote rows are matched by the
+branch part of their name, so `release/*` covers `origin/release/1.0` too.
+
+## Script mode
+
+The same selection rules work without the screen, for cron jobs or shell aliases:
+
+```sh
+git_pruner --prune-gone                        # list what would be deleted
+git_pruner --fetch --prune-gone --yes          # fetch, then delete
+git_pruner --merged-older-than 90 --yes        # delete merged branches older than 90 days
+```
+
+Nothing is deleted without `--yes` (`--dry-run` forces a listing even with it). Script mode never
+deletes remote branches, and never deletes a gone branch that holds commits missing from the
+default branch. It prints restore commands for what it deleted, and exits 1 if any delete failed.
+
+## Network calls
+
+`git fetch` and `git push --delete` run with `GIT_TERMINAL_PROMPT=0` and without a terminal, and
+stop after 60 seconds. A remote that asks for a password or does not answer fails with a message,
+instead of freezing the screen. Use a credential helper or an ssh agent for remotes that need a
+login.
+
+## Settings
+
+The sort field and order are saved in `~/Library/Application Support/git_pruner/settings`
+(macOS) or `~/.config/git_pruner/settings` (Linux), and restored on the next start.
 
 ## Development
 
 ```sh
-make build      # build straight to $BINDIR (default ~/shared/bin), skipping install.sh
+make build      # build straight to $BINDIR (default ~/shared/bin; override with BINDIR=...)
 make test       # go test ./...
 make vet        # go vet ./...
 make clean      # remove the binary from $BINDIR
@@ -195,6 +271,9 @@ would look mismatched if the width or theme drifted between them.
 
 [`docs/improvements.md`](docs/improvements.md) records the codebase analysis, the reasoning behind
 the current safety behavior, and the roadmap of remaining work.
+
+The code is split by layer: `git.go` (every git call), `model.go` (state and key handling),
+`view.go` (rendering), `cli.go` (script mode), `settings.go`, and `main.go`.
 
 The test suite drives a real `git` binary against throwaway repositories created per test, so it
 needs `git` on `PATH` and a committer identity (`user.name` / `user.email`); the tests set one

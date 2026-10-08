@@ -755,9 +755,19 @@ func TestDeletingIgnoresKeysExceptCtrlC(t *testing.T) {
 		}
 	}
 
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	// Quitting mid-run drops pushes not yet started, so the first ctrl+c only
+	// warns; the second quits.
+	nm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = nm.(model)
+	if cmd != nil || !m.abortArmed {
+		t.Fatal("the first ctrl+c must warn, not quit")
+	}
+	if o := stripANSI(m.deletingView()); !strings.Contains(o, "ctrl+c again to quit anyway") {
+		t.Fatalf("the warning must be on screen:\n%s", o)
+	}
+	_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
 	if cmd == nil {
-		t.Fatal("ctrl+c must abort")
+		t.Fatal("the second ctrl+c must abort")
 	}
 	if _, ok := cmd().(tea.QuitMsg); !ok {
 		t.Fatalf("ctrl+c should quit, got %T", cmd())
@@ -1113,7 +1123,7 @@ func TestRemotesPrefersOrigin(t *testing.T) {
 
 	git(t, repo, "remote", "add", "aaa-fork", repo)
 	git(t, repo, "fetch", "-q", "aaa-fork")
-	got := loadRemoteRefs().names
+	got := loadRemoteRefs(false).names
 	if len(got) == 0 || got[0] != "origin" {
 		t.Fatalf("origin should sort first, got %v", got)
 	}
@@ -1671,15 +1681,15 @@ func TestGoneCurrentBranchIsNotPruned(t *testing.T) {
 		t.Fatalf("status must not offer to prune the current branch: %q", m.status)
 	}
 
-	// Selected by hand, git refuses — a failure -D cannot rescue, so it must not
-	// raise the force prompt offering a retry that fails identically.
+	// A mark set past the keys still never reaches a delete.
 	b.selected = true
-	m = startAndDrain(t, m, true)
-	if len(m.results) != 1 || m.results[0].localOK {
-		t.Fatalf("deleting the checked-out branch must fail: %+v", m.results)
+	if sel := m.selectedBranches(); len(sel) != 0 {
+		t.Fatalf("the checked-out branch must never be offered for deletion: %v", branchNames(sel))
 	}
-	if m.results[0].forceable {
-		t.Fatalf("a checked-out branch cannot be rescued by -D: %q", m.results[0].localErr)
+	// Were it to reach git, git refuses — a failure -D cannot rescue, so it
+	// must not be offered a retry that fails identically.
+	if r := deleteBranch(*b, false, false); r.localOK || r.forceable {
+		t.Fatalf("deleting the checked-out branch must fail, unforceable: %+v", r)
 	}
 	if find(m.branches, "feature/tracked") == nil {
 		t.Fatal("feature/tracked must survive the refused delete")
@@ -1706,7 +1716,7 @@ func TestLocalOnlyRepo(t *testing.T) {
 	repo := setupLocalRepo(t)
 	chdir(t, repo)
 
-	if got := loadRemoteRefs().names; len(got) != 0 {
+	if got := loadRemoteRefs(false).names; len(got) != 0 {
 		t.Fatalf("no remotes should be configured, got %v", got)
 	}
 	if got := remoteDefault(); got != "" {
@@ -1827,24 +1837,24 @@ func TestDetachedHead(t *testing.T) {
 		t.Fatalf("feature/unmerged is not merged into the detached HEAD: %+v", b)
 	}
 
-	// With nothing current, `a` selects everything — there is no branch to spare.
+	// With nothing current, `a` selects everything but the protected trunk.
 	nm, _ := m.updateList(key("a"))
 	m = nm.(model)
-	if got := len(m.selectedBranches()); got != len(m.branches) {
-		t.Fatalf("select-all should take all %d branches, got %d", len(m.branches), got)
+	if got := len(m.selectedBranches()); got != len(m.branches)-1 || find(m.branches, "main").selected {
+		t.Fatalf("select-all should take all %d branches but main, got %d", len(m.branches)-1, got)
 	}
 
-	// Deleting the branch HEAD is parked on is legal while detached, and safe:
-	// the commits stay reachable from HEAD.
+	// Deleting a branch at the commit HEAD is parked on is legal while
+	// detached, and safe: the commits stay reachable from HEAD.
 	nm, _ = m.updateList(key("n"))
 	m = nm.(model)
-	find(m.branches, "main").selected = true
+	find(m.branches, "feature/merged").selected = true
 	m = startAndDrain(t, m, true)
 	if len(m.results) != 1 || !m.results[0].localOK {
-		t.Fatalf("main should delete cleanly while detached: %+v", m.results)
+		t.Fatalf("feature/merged should delete cleanly while detached: %+v", m.results)
 	}
-	if find(m.branches, "main") != nil {
-		t.Fatal("main should be gone")
+	if find(m.branches, "feature/merged") != nil {
+		t.Fatal("feature/merged should be gone")
 	}
 }
 
@@ -1970,7 +1980,7 @@ func TestUnreachableRemote(t *testing.T) {
 	if !strings.Contains(out, "deleted local feature/tracked") {
 		t.Fatalf("results must report the successful local delete:\n%s", out)
 	}
-	if !strings.Contains(out, "remote feature/tracked:") {
+	if !strings.Contains(out, "remote origin/feature/tracked:") {
 		t.Fatalf("results must report the failed push:\n%s", out)
 	}
 }
@@ -2066,7 +2076,7 @@ func TestRemoteDeleteRace(t *testing.T) {
 	if remoteHasBranch(t, repo, "feature/tracked") {
 		t.Fatal("the remote branch must be absent afterwards")
 	}
-	if o := stripANSI(m.resultView()); !strings.Contains(o, "deleted remote feature/tracked") {
+	if o := stripANSI(m.resultView()); !strings.Contains(o, "deleted remote origin/feature/tracked") {
 		t.Fatalf("results must report the remote as dealt with:\n%s", o)
 	}
 }
@@ -2387,7 +2397,7 @@ func TestResultViewWindowsItsBody(t *testing.T) {
 	if rows := screenRows(m.resultView()); rows > m.height {
 		t.Fatalf("40 results rendered %d rows into a %d-row terminal", rows, m.height)
 	}
-	if !strings.Contains(stripANSI(m.resultView()), "press q/enter to quit") {
+	if !strings.Contains(stripANSI(m.resultView()), "enter back to list · q quit") {
 		t.Fatal("the footer must stay on the screen")
 	}
 
@@ -2762,7 +2772,21 @@ func TestDiffRerendersOnResize(t *testing.T) {
 	}
 	m := model{width: 80, height: 24, state: stateDiff, diffRaw: "-a\n+b\n"}
 	m.diffLines, m.diffStyled = styleDiff(m.diffRaw, m.width)
-	nm, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	nm, cmd := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m = nm.(model)
+	if cmd == nil {
+		t.Fatal("resize must schedule a re-layout")
+	}
+	// A second resize before the wait ends makes the first one stale.
+	stale := cmd()
+	nm, cmd = m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m = nm.(model)
+	if _, c := m.Update(stale); c != nil {
+		t.Fatal("a resize that was overtaken must not run delta")
+	}
+	nm, cmd = m.Update(cmd()) // the wait ends; delta runs once
+	m = nm.(model)
+	nm, _ = m.Update(cmd())
 	m = nm.(model)
 	if !m.diffStyled || len(m.diffLines) != 1 || m.diffLines[0] != "w --width=140" {
 		t.Fatalf("resize must re-run delta at the new width, got %q", m.diffLines)
@@ -2874,7 +2898,7 @@ func TestDirtyWorktreeNeedsForce(t *testing.T) {
 	}
 	find(m.branches, "feature/merged").selected = true
 	m.force = false
-	if body := strings.Join(m.confirmBody(), "\n"); !strings.Contains(body, "remove worktree "+wt+" (refused if it has uncommitted changes)") {
+	if body := strings.Join(m.confirmBody(), "\n"); !strings.Contains(body, "remove worktree "+wt+" (refused if it has uncommitted changes; ignored files will be lost)") {
 		t.Fatalf("the safe confirm must say the worktree goes only if clean:\n%s", body)
 	}
 	m = startAndDrain(t, m, false)
@@ -2889,7 +2913,7 @@ func TestDirtyWorktreeNeedsForce(t *testing.T) {
 
 	find(m.branches, "feature/merged").selected = true
 	m.force = true
-	if body := strings.Join(m.confirmBody(), "\n"); !strings.Contains(body, "uncommitted changes will be lost") {
+	if body := strings.Join(m.confirmBody(), "\n"); !strings.Contains(body, "uncommitted and ignored files will be lost") {
 		t.Fatalf("the force confirm must warn that changes are discarded:\n%s", body)
 	}
 	m = startAndDrain(t, m, false)
@@ -2970,7 +2994,7 @@ func TestMainWorktreeBranchCannotBeMarked(t *testing.T) {
 			t.Fatalf("%s must not be selectable from a linked worktree", b.name)
 		}
 	}
-	if row := m.renderRow(*find(m.branches, "main"), 12, false); !strings.Contains(row, worktreeStyle.Render("+")) {
+	if row := m.renderRow(*find(m.branches, "main"), 12, false); !strings.Contains(stripANSI(row), " + main") {
 		t.Fatalf("a branch held by another worktree must show the + marker:\n%q", row)
 	}
 }

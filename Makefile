@@ -8,7 +8,7 @@ TARGET := $(BINDIR)/$(BINARY)
 
 build: $(TARGET)
 
-$(TARGET): main.go go.mod
+$(TARGET): $(wildcard *.go) go.mod
 	@mkdir -p $(BINDIR)
 	go build -o $(TARGET) .
 
