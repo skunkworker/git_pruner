@@ -252,10 +252,11 @@ matters for a local branch literally named like a remote one, e.g. `origin/x`).
 `proc_*.go` by an AST script — no hand edits in the move. **13.** `BINDIR` was already
 overridable; the Makefile now rebuilds on any `*.go` change.
 
-**New: locked branches.** `branch.locked()` = current, checked out in another worktree
-(`%(worktreepath)`, shown `+` like `git branch`), or protected (the trunk plus `pruner.protect`
-globs, shown `P`). Locked rows cannot be marked by any key, and `selectedBranches` drops them as a
-second guard.
+**New: locked branches.** `branch.locked()` = current, checked out in the main worktree, or
+protected (the trunk plus `pruner.protect` globs, shown `P`). Locked rows cannot be marked by any
+key, and `selectedBranches` drops them as a second guard. A branch in a linked worktree
+(`%(worktreepath)`, shown `+` like `git branch`) is not locked: its delete runs `git worktree
+remove` first.
 
 **New: remote-only view (`tab`).** Remote branches no local branch tracks, as rows in the same
 slice with `remoteOnly` set; `viewIdx` filters by mode, so marks survive a view switch like they

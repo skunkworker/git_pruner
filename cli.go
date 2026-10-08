@@ -61,6 +61,9 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 	if *dryRun || !*yes {
 		for _, b := range sel {
 			line := "would delete " + b.name + " (" + b.deleteFlag(false) + ")"
+			if w := m.worktreeWarning(b); w != "" {
+				line += "  " + w
+			}
 			if w := m.riskWarning(b); w != "" {
 				line += "  " + w
 			}
@@ -76,12 +79,15 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 	results := make([]deleteResult, len(sel))
 	var wg sync.WaitGroup
 	for i, b := range sel {
-		wg.Go(func() { results[i] = deleteBranch(b, b.deleteFlag(false), false) })
+		wg.Go(func() { results[i] = deleteBranch(b, false, false) })
 	}
 	wg.Wait()
 
 	code := 0
 	for _, r := range results {
+		if r.worktreeRemoved {
+			fmt.Fprintf(stdout, "removed worktree %s\n", r.br.worktree)
+		}
 		if r.localOK {
 			fmt.Fprintf(stdout, "deleted %s (was %s)\n", r.br.name, r.br.hash)
 		} else {

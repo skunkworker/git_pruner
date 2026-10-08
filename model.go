@@ -49,20 +49,27 @@ const (
 )
 
 type deleteResult struct {
-	br          branch // the branch this deletion was run for
-	done        bool   // the async deletion for this branch has completed
-	localOK     bool
-	localErr    string
-	forceable   bool // a safe (-d) delete failed and could be retried with -D
-	remoteTried bool
-	remoteOK    bool
-	remoteErr   string
+	br   branch // the branch this deletion was run for
+	done bool   // the async deletion for this branch has completed
+	// worktreeRemoved records that the linked worktree holding br was removed
+	// to free the branch for deletion.
+	worktreeRemoved bool
+	localOK         bool
+	localErr        string
+	forceable       bool // a safe (-d) delete failed and could be retried with -D
+	remoteTried     bool
+	remoteOK        bool
+	remoteErr       string
 	// remoteSkipped records that the armed push was deliberately deferred
 	// because the local delete failed — the one piece of state not derivable
 	// from br, since arming is the caller's decision.
 	remoteSkipped bool
 	restored      bool // undo recreated the local branch
 }
+
+// worktreePending reports whether a linked worktree still holds r's branch, so
+// a force retry has to remove it first.
+func (r deleteResult) worktreePending() bool { return r.br.worktree != "" && !r.worktreeRemoved }
 
 // restorable reports whether undo can bring r's local branch back.
 func (r deleteResult) restorable() bool {
@@ -254,9 +261,9 @@ var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 // deleteBranchCmd wraps the deleteBranch worker as a tea.Cmd so deletions run off
 // the update loop. It captures only a branch value (never the model), so each runs
 // independently and concurrently under tea.Batch.
-func deleteBranchCmd(idx int, b branch, flag string, wantRemote bool) tea.Cmd {
+func deleteBranchCmd(idx int, b branch, force, wantRemote bool) tea.Cmd {
 	return func() tea.Msg {
-		return branchDeletedMsg{idx: idx, res: deleteBranch(b, flag, wantRemote)}
+		return branchDeletedMsg{idx: idx, res: deleteBranch(b, force, wantRemote)}
 	}
 }
 
@@ -855,7 +862,7 @@ func (m *model) startDeletions(includeRemote bool) tea.Cmd {
 	for i, b := range sel {
 		m.results[i] = deleteResult{br: b}
 		wantRemote := includeRemote && b.remoteArmed()
-		cmds = append(cmds, deleteBranchCmd(i, b, b.deleteFlag(m.force), wantRemote))
+		cmds = append(cmds, deleteBranchCmd(i, b, m.force, wantRemote))
 	}
 	return tea.Batch(cmds...)
 }
@@ -1195,6 +1202,11 @@ func (m *model) forceDeleteUnmerged() {
 	for i := range m.results {
 		r := &m.results[i]
 		if r.localOK || !r.forceable {
+			continue
+		}
+		// deleteBranch kept the worktree while -d was going to refuse the
+		// branch; the user has now agreed to the delete, so free it.
+		if r.worktreePending() && !removeWorktree(r) {
 			continue
 		}
 		if _, err := runGit("branch", "-D", r.br.name); err != nil {

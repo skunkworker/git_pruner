@@ -239,9 +239,9 @@ func TestGoneMergedBranchIsNotFlaggedUnmerged(t *testing.T) {
 	}
 }
 
-// A branch checked out in another worktree is marked + and cannot be selected;
-// git would refuse to delete it anyway.
-func TestWorktreeBranchIsLocked(t *testing.T) {
+// A branch checked out in a linked worktree is marked + and can be selected:
+// the delete removes the worktree first (see TestWorktreeBranchDeletes).
+func TestWorktreeBranchIsMarked(t *testing.T) {
 	repo := setupRepo(t)
 	chdir(t, repo)
 	git(t, repo, "worktree", "add", "-q", filepath.Join(t.TempDir(), "wt"), "feature/unmerged")
@@ -250,13 +250,13 @@ func TestWorktreeBranchIsLocked(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := find(m.branches, "feature/unmerged")
-	if !b.worktree || b.isCurrent {
-		t.Fatalf("want a worktree branch: %+v", b)
+	if b.worktree == "" || b.isCurrent || b.locked() {
+		t.Fatalf("want an unlocked worktree branch: %+v", b)
 	}
 	cursorTo(t, &m, "feature/unmerged")
-	m = press(t, m, key(" "), key("a"))
-	if find(m.branches, "feature/unmerged").selected {
-		t.Fatal("a worktree branch must not be selectable")
+	m = press(t, m, key(" "))
+	if !find(m.branches, "feature/unmerged").selected {
+		t.Fatal("a linked worktree branch must be selectable")
 	}
 	if row := stripANSI(m.renderRow(*b, 20, false)); !strings.Contains(row, " + feature/unmerged") {
 		t.Fatalf("the row must carry the + marker: %q", row)

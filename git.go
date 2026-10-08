@@ -37,9 +37,10 @@ type branch struct {
 	riskCommits  int  // commits whose patch is not in the base branch; -D discards them
 	riskMeasured bool // riskCommits has been computed (0 is a meaningful value)
 	isCurrent    bool
-	worktree     bool // checked out in another worktree; git refuses to delete it
-	protected    bool // matches the default branch or a pruner.protect pattern
-	remoteOnly   bool // a remote branch that no local branch tracks
+	worktree     string // path of another worktree that has the branch checked out; "" when none does
+	mainWorktree bool   // that worktree is the main one, which git cannot remove
+	protected    bool   // matches the default branch or a pruner.protect pattern
+	remoteOnly   bool   // a remote branch that no local branch tracks
 	selected     bool
 	deleteRemote bool
 }
@@ -48,8 +49,10 @@ type branch struct {
 // a remoteOnly row arms it: deleting the remote branch is all it offers.
 func (b branch) remoteArmed() bool { return (b.deleteRemote || b.remoteOnly) && b.upstream != "" }
 
-// locked reports whether b can never be marked for deletion.
-func (b branch) locked() bool { return b.isCurrent || b.worktree || b.protected }
+// locked reports whether b can never be marked for deletion. A branch in a
+// linked worktree is not: the delete removes the worktree first. The main
+// worktree cannot be removed, so its branch stays locked.
+func (b branch) locked() bool { return b.isCurrent || b.mainWorktree || b.protected }
 
 // ref is b's fully qualified ref (see branchRef).
 func (b branch) ref() string {
@@ -100,6 +103,12 @@ func (b branch) safeDeletable() bool {
 // would turn on HEAD alone and refuse branches whose work is in the remote
 // default but not in the local checkout — the headline prune case.
 func (b branch) forcedDelete(force bool) bool { return force || b.gone }
+
+// safeDeleteRefuses reports whether the delete of b under the given force mode
+// will run -d and be refused as not fully merged.
+func (b branch) safeDeleteRefuses(force bool) bool {
+	return !b.forcedDelete(force) && !b.safeDeletable()
+}
 
 // Concurrency caps. Local git work is subprocess-bound — roughly 6ms of spawn
 // cost each — so running it a few at a time is what makes a repo full of gone
@@ -298,7 +307,9 @@ func loadBranches() ([]branch, error) {
 		b.upstream = shortRef(f[0])
 		b.isCurrent = f[2] == "*"
 		// %(worktreepath) is set for the current worktree's branch too.
-		b.worktree = f[3] != "" && !b.isCurrent
+		if !b.isCurrent {
+			b.worktree = f[3]
+		}
 		b.upRemote, b.upMerge = f[4], f[5]
 		track := f[1]
 		if strings.Contains(track, "gone") {
@@ -539,15 +550,34 @@ func loadRepo(withRemote bool) ([]branch, repoReads, error) {
 		branches []branch
 		err      error
 		reads    repoReads
+		mainWT   string
 	)
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
 	go func() { defer wg.Done(); branches, err = loadBranches() }()
 	go func() { defer wg.Done(); reads.headMerged = localMergedSet() }()
 	go func() { defer wg.Done(); reads.remotes = loadRemoteRefs(withRemote) }()
 	go func() { defer wg.Done(); reads.config = loadConfig() }()
+	go func() { defer wg.Done(); mainWT = mainWorktreePath() }()
 	wg.Wait()
+	for i := range branches {
+		branches[i].mainWorktree = mainWT != "" && branches[i].worktree == mainWT
+	}
 	return branches, reads, err
+}
+
+// mainWorktreePath returns the path of the repository's main worktree, which git
+// always lists first. "" when the list cannot be read.
+func mainWorktreePath() string {
+	out, err := runGit("worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return ""
+	}
+	first, _, _ := strings.Cut(out, "\x00")
+	if path, ok := strings.CutPrefix(first, "worktree "); ok {
+		return path
+	}
+	return ""
 }
 
 // loadDiff returns the patch introduced on name relative to its merge-base with
@@ -601,8 +631,9 @@ func (b branch) deleteFlag(force bool) string {
 
 // deleteBranch runs one branch's local delete and, when wantRemote is set, its
 // remote-branch push --delete. It is the worker deleteBranchCmd runs off the
-// update loop, one cmd per branch.
-func deleteBranch(b branch, flag string, wantRemote bool) deleteResult {
+// update loop, one cmd per branch. force is the user's force mode, which picks
+// the delete flag.
+func deleteBranch(b branch, force, wantRemote bool) deleteResult {
 	res := deleteResult{br: b, done: true}
 	if b.remoteOnly {
 		// There is no local branch; the push is the whole job.
@@ -611,14 +642,25 @@ func deleteBranch(b branch, flag string, wantRemote bool) deleteResult {
 		}
 		return res
 	}
-	if _, err := runGit("branch", flag, b.name); err != nil {
-		res.localErr = err.Error()
-		// Only an unmerged refusal is worth escalating to -D. Other failures — a
-		// branch held by another worktree, most commonly — fail identically under
-		// -D, so offering the retry would just mislabel them as lost commits.
-		res.forceable = flag == "-d" && strings.Contains(res.localErr, "not fully merged")
-	} else {
-		res.localOK = true
+	flag := b.deleteFlag(force)
+	switch {
+	case b.worktree != "" && b.safeDeleteRefuses(force):
+		// git checks the worktree before the merge, so -d would report the
+		// worktree, not the unmerged commits that the force retry can clear.
+		// The worktree stays until the user agrees to that retry.
+		res.localErr = "not fully merged (worktree kept)"
+		res.forceable = true
+	case b.worktree != "" && !removeWorktree(&res):
+	default:
+		if _, err := runGit("branch", flag, b.name); err != nil {
+			res.localErr = err.Error()
+			// Only an unmerged refusal is worth escalating to -D. Other
+			// failures fail identically under -D, so offering the retry would
+			// just mislabel them as lost commits.
+			res.forceable = flag == "-d" && strings.Contains(res.localErr, "not fully merged")
+		} else {
+			res.localOK = true
+		}
 	}
 	// Never delete the remote copy while the local branch survives a refused
 	// delete: that would strand its commits with nowhere else to exist. The push
@@ -631,6 +673,20 @@ func deleteBranch(b branch, flag string, wantRemote bool) deleteResult {
 		res.remoteSkipped = true
 	}
 	return res
+}
+
+// removeWorktree removes the linked worktree holding res's branch: git refuses to
+// delete a branch any worktree has checked out, under -d and -D alike. A
+// worktree is scratch space for its branch, so it goes with everything in it,
+// uncommitted changes included. A locked worktree is refused: someone locked it
+// on purpose. It reports whether the branch is now free to delete.
+func removeWorktree(res *deleteResult) bool {
+	if _, err := runGit("worktree", "remove", "--force", res.br.worktree); err != nil {
+		res.localErr = "worktree " + res.br.worktree + ": " + cleanText(err.Error())
+		return false
+	}
+	res.worktreeRemoved = true
+	return true
 }
 
 // pushRemoteDelete deletes res's remote branch, clearing any deferral: the
