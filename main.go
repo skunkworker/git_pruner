@@ -79,6 +79,12 @@ func (b branch) deletable() bool { return !b.isCurrent && !b.mainWorktree }
 // default but not in the local checkout — the headline prune case.
 func (b branch) forcedDelete(force bool) bool { return force || b.gone }
 
+// safeDeleteRefuses reports whether the delete of b under the given force mode
+// will run -d and be refused as not fully merged.
+func (b branch) safeDeleteRefuses(force bool) bool {
+	return !b.forcedDelete(force) && !b.safeDeletable()
+}
+
 type sortField int
 
 const (
@@ -548,11 +554,10 @@ func mainWorktreePath() string {
 		return ""
 	}
 	first, _, _ := strings.Cut(out, "\x00")
-	path, ok := strings.CutPrefix(first, "worktree ")
-	if !ok {
-		return ""
+	if path, ok := strings.CutPrefix(first, "worktree "); ok {
+		return path
 	}
-	return path
+	return ""
 }
 
 // loadRepo reads the branch list and everything independent of it in one round.
@@ -1180,23 +1185,24 @@ func deleteBranch(b branch, force, wantRemote bool) deleteResult {
 	res := deleteResult{br: b, done: true}
 	flag := b.deleteFlag(force)
 	switch {
-	case b.worktree != "" && flag == "-d" && !b.safeDeletable():
+	case b.worktree != "" && b.safeDeleteRefuses(force):
 		// git checks the worktree before the merge, so -d would report the
 		// worktree, not the unmerged commits that the force retry can clear.
 		// The worktree stays until the user agrees to that retry.
-		res.localErr = fmt.Sprintf("the branch '%s' is not fully merged (worktree kept)", b.name)
+		res.localErr = "not fully merged (worktree kept)"
+		res.forceable = true
 	case b.worktree != "" && !removeWorktree(&res, force):
 	default:
 		if _, err := runGit("branch", flag, b.name); err != nil {
 			res.localErr = err.Error()
+			// Only an unmerged refusal is worth escalating to -D. Other
+			// failures fail identically under -D, so offering the retry would
+			// just mislabel them as lost commits.
+			res.forceable = flag == "-d" && strings.Contains(res.localErr, "not fully merged")
 		} else {
 			res.localOK = true
 		}
 	}
-	// Only an unmerged refusal is worth escalating to -D. Other failures — a
-	// worktree that will not be removed, most commonly — fail identically under
-	// -D, so offering the retry would just mislabel them as lost commits.
-	res.forceable = !res.localOK && flag == "-d" && strings.Contains(res.localErr, "not fully merged")
 	// Never delete the remote copy while the local branch survives a refused
 	// delete: that would strand its commits with nowhere else to exist. The push
 	// is deferred until the force retry clears the local branch.
@@ -1227,6 +1233,10 @@ func removeWorktree(res *deleteResult, force bool) bool {
 	res.worktreeRemoved = true
 	return true
 }
+
+// worktreePending reports whether a linked worktree still holds r's branch, so
+// a force retry has to remove it first.
+func (r deleteResult) worktreePending() bool { return r.br.worktree != "" && !r.worktreeRemoved }
 
 // pushRemoteDelete deletes res's remote branch, clearing any deferral: the
 // results screen tests remoteSkipped first, so a stale flag would report the
@@ -1392,7 +1402,7 @@ func (m *model) forceDeleteUnmerged() {
 		}
 		// deleteBranch kept the worktree while -d was going to refuse the
 		// branch; the user has now agreed to the delete, so free it.
-		if r.br.worktree != "" && !r.worktreeRemoved && !removeWorktree(r, m.force) {
+		if r.worktreePending() && !removeWorktree(r, m.force) {
 			continue
 		}
 		if _, err := runGit("branch", "-D", r.br.name); err != nil {
@@ -1935,17 +1945,17 @@ func (m model) confirmView() string { return m.page(m.confirmParts()) }
 // or "" when no worktree does. git refuses to delete a branch a worktree has
 // checked out, so the worktree is removed first.
 func (m model) worktreeWarning(br branch) string {
-	if br.worktree == "" {
+	switch {
+	case br.worktree == "":
 		return ""
-	}
-	if m.force {
+	case m.force:
 		return "+ remove worktree " + br.worktree + " (uncommitted changes will be lost)"
-	}
-	if br.forcedDelete(false) || br.safeDeletable() {
+	case br.safeDeleteRefuses(false):
+		// The worktree stays until the force retry.
+		return "+ remove worktree " + br.worktree + " if you then force delete"
+	default:
 		return "+ remove worktree " + br.worktree + " (refused if it has uncommitted changes)"
 	}
-	// -d will refuse the branch, so the worktree stays until the force retry.
-	return "+ remove worktree " + br.worktree + " if you then force delete"
 }
 
 // riskWarning states the cost of deleting br, or "" when the delete is clean.
@@ -1999,7 +2009,7 @@ func (m model) forcePromptParts() (header, body, footer []string) {
 		if r.remoteSkipped {
 			body = append(body, "      "+errStyle.Render(fmt.Sprintf("+ remote %s/%s will be deleted once the branch is gone", r.br.remoteName(), r.br.remoteBranch())))
 		}
-		if r.br.worktree != "" && !r.worktreeRemoved {
+		if r.worktreePending() {
 			body = append(body, "      "+errStyle.Render("+ worktree "+r.br.worktree+" will be removed first"))
 		}
 	}
