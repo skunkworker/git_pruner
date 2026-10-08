@@ -34,6 +34,8 @@ type branch struct {
 	riskCommits  int  // commits whose patch is not in the base branch; -D discards them
 	riskMeasured bool // riskCommits has been computed (0 is a meaningful value)
 	isCurrent    bool
+	worktree     string // path of the worktree that has the branch checked out; "" when none does
+	mainWorktree bool   // that worktree is the main one, which git cannot remove
 	selected     bool
 	deleteRemote bool
 }
@@ -65,6 +67,11 @@ func (b branch) safeDeletable() bool {
 	}
 	return b.headMerged
 }
+
+// deletable reports whether the list lets b be marked for deletion. git
+// refuses to delete the branch checked out here, and the main worktree, unlike
+// a linked one, cannot be removed to free the branch it holds.
+func (b branch) deletable() bool { return !b.isCurrent && !b.mainWorktree }
 
 // forcedDelete reports whether b will be deleted with -D rather than -d. Gone
 // branches always are: git reports no track info for them, so a safe delete
@@ -107,14 +114,17 @@ const (
 )
 
 type deleteResult struct {
-	br          branch // the branch this deletion was run for
-	done        bool   // the async deletion for this branch has completed
-	localOK     bool
-	localErr    string
-	forceable   bool // a safe (-d) delete failed and could be retried with -D
-	remoteTried bool
-	remoteOK    bool
-	remoteErr   string
+	br   branch // the branch this deletion was run for
+	done bool   // the async deletion for this branch has completed
+	// worktreeRemoved records that the linked worktree holding br was removed
+	// to free the branch for deletion.
+	worktreeRemoved bool
+	localOK         bool
+	localErr        string
+	forceable       bool // a safe (-d) delete failed and could be retried with -D
+	remoteTried     bool
+	remoteOK        bool
+	remoteErr       string
 	// remoteSkipped records that the armed push was deliberately deferred
 	// because the local delete failed — the one piece of state not derivable
 	// from br, since arming is the caller's decision.
@@ -317,7 +327,7 @@ var trackRe = regexp.MustCompile(`ahead (\d+)|behind (\d+)`)
 
 func loadBranches() ([]branch, error) {
 	const format = "%(refname)%00%(objectname:short)%00%(committerdate:iso8601-strict)%00" +
-		"%(committerdate:relative)%00%(upstream)%00%(upstream:track)%00%(HEAD)%00%(contents:subject)"
+		"%(committerdate:relative)%00%(upstream)%00%(upstream:track)%00%(HEAD)%00%(worktreepath)%00%(contents:subject)"
 	out, err := runGit("for-each-ref", "--format="+format, "refs/heads")
 	if err != nil {
 		return nil, err
@@ -328,7 +338,7 @@ func loadBranches() ([]branch, error) {
 			continue
 		}
 		f := strings.Split(line, "\x00")
-		if len(f) < 8 {
+		if len(f) < 9 {
 			continue
 		}
 		b := branch{
@@ -337,7 +347,8 @@ func loadBranches() ([]branch, error) {
 			committedRel: f[3],
 			upstream:     shortRef(f[4]),
 			isCurrent:    f[6] == "*",
-			subject:      f[7],
+			worktree:     f[7],
+			subject:      f[8],
 		}
 		if t, terr := time.Parse(time.RFC3339, f[2]); terr == nil {
 			b.committed = t
@@ -528,8 +539,23 @@ type repoReads struct {
 	remotes    remoteRefs
 }
 
+// mainWorktreePath returns the path of the repository's main worktree, which git
+// always lists first. "" when the list cannot be read.
+func mainWorktreePath() string {
+	out, err := runGit("worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return ""
+	}
+	first, _, _ := strings.Cut(out, "\x00")
+	path, ok := strings.CutPrefix(first, "worktree ")
+	if !ok {
+		return ""
+	}
+	return path
+}
+
 // loadRepo reads the branch list and everything independent of it in one round.
-// Starting a git subprocess costs about 6ms, and none of these three waits on
+// Starting a git subprocess costs about 6ms, and none of these four waits on
 // another, so the depth of the chain is what the user waits on — not the work
 // inside it.
 func loadRepo() ([]branch, repoReads, error) {
@@ -537,13 +563,20 @@ func loadRepo() ([]branch, repoReads, error) {
 		branches []branch
 		err      error
 		reads    repoReads
+		mainWT   string
 	)
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 	go func() { defer wg.Done(); branches, err = loadBranches() }()
 	go func() { defer wg.Done(); reads.headMerged = localMergedSet() }()
 	go func() { defer wg.Done(); reads.remotes = loadRemoteRefs() }()
+	go func() { defer wg.Done(); mainWT = mainWorktreePath() }()
 	wg.Wait()
+	// Marked here rather than in applyBranches so carryMarks, which runs
+	// first, already knows which branches cannot be marked.
+	for i := range branches {
+		branches[i].mainWorktree = mainWT != "" && branches[i].worktree == mainWT
+	}
 	return branches, reads, err
 }
 
@@ -600,9 +633,9 @@ var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 // deleteBranchCmd wraps the deleteBranch worker as a tea.Cmd so deletions run off
 // the update loop. It captures only a branch value (never the model), so each runs
 // independently and concurrently under tea.Batch.
-func deleteBranchCmd(idx int, b branch, flag string, wantRemote bool) tea.Cmd {
+func deleteBranchCmd(idx int, b branch, force, wantRemote bool) tea.Cmd {
 	return func() tea.Msg {
-		return branchDeletedMsg{idx: idx, res: deleteBranch(b, flag, wantRemote)}
+		return branchDeletedMsg{idx: idx, res: deleteBranch(b, force, wantRemote)}
 	}
 }
 
@@ -926,11 +959,11 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor = len(m.branches) // clampCursor lands it on the last visible row
 		m.clampCursor()
 	case " ":
-		if b := m.cur(); b != nil && !b.isCurrent {
+		if b := m.cur(); b != nil && b.deletable() {
 			b.selected = !b.selected
 		}
 	case "r":
-		if b := m.cur(); b != nil && b.upstream != "" && !b.isCurrent {
+		if b := m.cur(); b != nil && b.upstream != "" && b.deletable() {
 			b.deleteRemote = !b.deleteRemote
 		}
 	case "/":
@@ -943,7 +976,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Select what the list shows: with a filter active, a marks only the
 		// matching branches, which is what makes filter-then-select useful.
 		for _, i := range m.viewIdx() {
-			if !m.branches[i].isCurrent {
+			if m.branches[i].deletable() {
 				m.branches[i].selected = true
 			}
 		}
@@ -1056,7 +1089,7 @@ func (m *model) startDeletions(includeRemote bool) tea.Cmd {
 	for i, b := range sel {
 		m.results[i] = deleteResult{br: b}
 		wantRemote := includeRemote && b.deleteRemote && b.upstream != ""
-		cmds = append(cmds, deleteBranchCmd(i, b, b.deleteFlag(m.force), wantRemote))
+		cmds = append(cmds, deleteBranchCmd(i, b, m.force, wantRemote))
 	}
 	return tea.Batch(cmds...)
 }
@@ -1140,18 +1173,29 @@ func (b branch) deleteFlag(force bool) string {
 
 // deleteBranch runs one branch's local delete and, when wantRemote is set, its
 // remote-branch push --delete. It is the worker deleteBranchCmd runs off the
-// update loop, one cmd per branch.
-func deleteBranch(b branch, flag string, wantRemote bool) deleteResult {
+// update loop, one cmd per branch. force is the user's force mode: it picks the
+// delete flag and lets a worktree with uncommitted changes be removed.
+func deleteBranch(b branch, force, wantRemote bool) deleteResult {
 	res := deleteResult{br: b, done: true}
-	if _, err := runGit("branch", flag, b.name); err != nil {
-		res.localErr = err.Error()
-		// Only an unmerged refusal is worth escalating to -D. Other failures — a
-		// branch held by another worktree, most commonly — fail identically under
-		// -D, so offering the retry would just mislabel them as lost commits.
-		res.forceable = flag == "-d" && strings.Contains(res.localErr, "not fully merged")
-	} else {
-		res.localOK = true
+	flag := b.deleteFlag(force)
+	switch {
+	case b.worktree != "" && flag == "-d" && !b.safeDeletable():
+		// git checks the worktree before the merge, so -d would report the
+		// worktree, not the unmerged commits that the force retry can clear.
+		// The worktree stays until the user agrees to that retry.
+		res.localErr = fmt.Sprintf("the branch '%s' is not fully merged (worktree kept)", b.name)
+	case b.worktree != "" && !removeWorktree(&res, force):
+	default:
+		if _, err := runGit("branch", flag, b.name); err != nil {
+			res.localErr = err.Error()
+		} else {
+			res.localOK = true
+		}
 	}
+	// Only an unmerged refusal is worth escalating to -D. Other failures — a
+	// worktree that will not be removed, most commonly — fail identically under
+	// -D, so offering the retry would just mislabel them as lost commits.
+	res.forceable = !res.localOK && flag == "-d" && strings.Contains(res.localErr, "not fully merged")
 	// Never delete the remote copy while the local branch survives a refused
 	// delete: that would strand its commits with nowhere else to exist. The push
 	// is deferred until the force retry clears the local branch.
@@ -1163,6 +1207,24 @@ func deleteBranch(b branch, flag string, wantRemote bool) deleteResult {
 		res.remoteSkipped = true
 	}
 	return res
+}
+
+// removeWorktree removes the linked worktree holding res's branch: git refuses to
+// delete a branch any worktree has checked out, under -d and -D alike. Without
+// force, git refuses a worktree with uncommitted changes or untracked files;
+// with it, they are discarded. A worktree whose directory is already gone is
+// removed either way. It reports whether the branch is now free to delete.
+func removeWorktree(res *deleteResult, force bool) bool {
+	args := []string{"worktree", "remove"}
+	if force {
+		args = append(args, "--force")
+	}
+	if _, err := runGit(append(args, res.br.worktree)...); err != nil {
+		res.localErr = "worktree " + res.br.worktree + ": " + err.Error()
+		return false
+	}
+	res.worktreeRemoved = true
+	return true
 }
 
 // pushRemoteDelete deletes res's remote branch, clearing any deferral: the
@@ -1192,11 +1254,12 @@ func carryMarks(old, fresh []branch) []branch {
 	}
 	for i := range fresh {
 		if p, ok := prev[fresh[i].name]; ok {
-			// Marks never land on the current branch: it cannot be deleted, so
-			// a carried mark would arm an operation the list refuses to offer
-			// (relevant after a switch, or when HEAD moved outside the TUI).
-			fresh[i].selected = p.selected && !fresh[i].isCurrent
-			fresh[i].deleteRemote = p.deleteRemote && !fresh[i].gone && !fresh[i].isCurrent
+			// Marks never land on a branch that cannot be deleted, such as the
+			// current one: a carried mark would arm an operation the list
+			// refuses to offer (relevant after a switch, or when HEAD moved
+			// outside the TUI).
+			fresh[i].selected = p.selected && fresh[i].deletable()
+			fresh[i].deleteRemote = p.deleteRemote && !fresh[i].gone && fresh[i].deletable()
 		}
 	}
 	return fresh
@@ -1324,6 +1387,11 @@ func (m *model) forceDeleteUnmerged() {
 	for i := range m.results {
 		r := &m.results[i]
 		if r.localOK || !r.forceable {
+			continue
+		}
+		// deleteBranch kept the worktree while -d was going to refuse the
+		// branch; the user has now agreed to the delete, so free it.
+		if r.br.worktree != "" && !r.worktreeRemoved && !removeWorktree(r, m.force) {
 			continue
 		}
 		if _, err := runGit("branch", "-D", r.br.name); err != nil {
@@ -1590,7 +1658,7 @@ func (m *model) selectGone() string {
 	gone, risky := 0, 0
 	for i := range m.branches {
 		br := &m.branches[i]
-		if !br.gone || br.isCurrent {
+		if !br.gone || !br.deletable() {
 			continue
 		}
 		gone++

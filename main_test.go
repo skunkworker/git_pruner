@@ -509,7 +509,7 @@ func TestDeleteBranchCmd(t *testing.T) {
 	chdir(t, repo)
 
 	// Local-only safe delete of the merged branch.
-	msg := deleteBranchCmd(2, branch{name: "feature/merged"}, "-d", false)()
+	msg := deleteBranchCmd(2, branch{name: "feature/merged"}, false, false)()
 	dm, ok := msg.(branchDeletedMsg)
 	if !ok {
 		t.Fatalf("want branchDeletedMsg, got %T", msg)
@@ -523,7 +523,7 @@ func TestDeleteBranchCmd(t *testing.T) {
 
 	// Force delete + remote push of the tracked branch.
 	tracked := branch{name: "feature/tracked", upstream: "origin/feature/tracked", ahead: 1}
-	dm2 := deleteBranchCmd(0, tracked, "-D", true)().(branchDeletedMsg)
+	dm2 := deleteBranchCmd(0, tracked, true, true)().(branchDeletedMsg)
 	if !dm2.res.localOK {
 		t.Fatalf("force local delete failed: %s", dm2.res.localErr)
 	}
@@ -1377,33 +1377,31 @@ func TestNonUnmergedFailureIsNotForceable(t *testing.T) {
 	repo := setupRepo(t)
 	chdir(t, repo)
 
-	// A second worktree holds feature/unmerged; git refuses to delete it under
-	// -d and -D alike.
+	// A second worktree holds the merged branch and an untracked file, so a
+	// safe delete must refuse to remove the worktree, and with it the branch.
 	wt := t.TempDir() + "/wt"
-	git(t, repo, "worktree", "add", "-q", wt, "feature/unmerged")
-
-	if _, err := runGit("branch", "-D", "feature/unmerged"); err == nil {
-		t.Fatal("precondition: -D should also fail for a branch held by a worktree")
+	git(t, repo, "worktree", "add", "-q", wt, "feature/merged")
+	if err := os.WriteFile(wt+"/scratch", []byte("unsaved work"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	b := branch{name: "feature/unmerged"}
-	res := deleteBranch(b, "-d", false)
-	if res.localOK {
-		t.Fatalf("delete should have failed: %+v", res)
-	}
-	if res.forceable {
-		t.Fatalf("a worktree conflict must not be offered as force-retryable: %q", res.localErr)
-	}
-
-	// End to end: the async path lands on the results screen, not the prompt.
 	m, err := initialModel()
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.results = []deleteResult{{br: branch{name: "feature/unmerged"}}}
+	b := *find(m.branches, "feature/merged")
+	res := deleteBranch(b, false, false)
+	if res.localOK {
+		t.Fatalf("delete should have failed: %+v", res)
+	}
+	if res.forceable {
+		t.Fatalf("a dirty worktree must not be offered as force-retryable: %q", res.localErr)
+	}
+
+	// End to end: the async path lands on the results screen, not the prompt.
+	m.results = []deleteResult{{br: b}}
 	m.state = stateDeleting
-	msg := deleteBranchCmd(0, *find(m.branches, "feature/unmerged"), "-d", false)()
-	nm, _ := m.Update(msg)
+	nm, _ := m.Update(deleteBranchCmd(0, b, false, false)())
 	if got := nm.(model).state; got != stateResult {
 		t.Fatalf("state should be stateResult, got %v", got)
 	}
