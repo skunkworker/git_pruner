@@ -45,7 +45,7 @@ git_pruner version     # also --version, -v
 | -------------- | ------------------------------------------------------------- |
 | `↑`/`k`, `↓`/`j` | Move cursor                                                 |
 | `g` / `G`      | Jump to top / bottom                                          |
-| `space`        | Toggle selection (the current branch cannot be selected)     |
+| `space`        | Toggle selection (the current branch, and a branch checked out in the main worktree, cannot be selected) |
 | `a` / `n`      | Select all listed branches / clear selection                 |
 | `c`            | Checkout the branch under the cursor (`git switch`)           |
 | `/`            | Filter branches by name; `enter` keeps it, `esc` clears it    |
@@ -85,7 +85,8 @@ precedence, so `y`, `R` and `n` still work while a list is scrolled.
 > [x] R *  feature/foo        ↑2↓1 ✓  3 days ago   a1b2c3d  Fix the thing
 ```
 
-- `>` cursor, `[x]` selected, `R` remote deletion armed, `*` current branch
+- `>` cursor, `[x]` selected, `R` remote deletion armed, `*` current branch, `+` checked out in
+  another worktree
 - ahead/behind shown as `↑N↓M` (`=` when in sync, `gone` in red when the upstream was deleted)
 - a green `✓` after the track column means the upstream is merged into the remote default
   branch — i.e. the remote is safe to delete
@@ -156,6 +157,20 @@ claiming the work is unrecoverable.
 - A confirmation screen always lists exactly what will be deleted before anything happens.
   Deletions then run concurrently in the background on a live progress screen, and a results
   screen reports per-branch success or failure.
+
+## Branches checked out in a worktree
+
+git refuses to delete a branch that any worktree has checked out, even with `-D`. git_pruner
+marks such a branch with `+` and runs `git worktree remove` before it deletes the branch. The
+confirmation screen names each worktree it will remove.
+
+- In safe mode, git refuses to remove a worktree with uncommitted changes or untracked files,
+  and the branch stays. Force mode (`f`) removes the worktree with `--force` and discards them.
+- A worktree whose directory is already gone is removed in either mode.
+- If the safe delete (`-d`) would refuse the branch as not fully merged, the worktree stays
+  until you accept the force delete prompt.
+- A branch checked out in the main worktree cannot be selected: git cannot remove the main
+  worktree. This happens when you run git_pruner from a linked worktree.
 
 ## Development
 

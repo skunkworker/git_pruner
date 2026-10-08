@@ -184,15 +184,16 @@ var (
 // ---- styles ----
 
 var (
-	currentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	cursorStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	rowBgStyle   = lipgloss.NewStyle().Background(lipgloss.Color("236")) // cursor row band
-	selStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	goneStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	headerStyle  = lipgloss.NewStyle().Bold(true)
-	okStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	currentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	cursorStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	rowBgStyle    = lipgloss.NewStyle().Background(lipgloss.Color("236")) // cursor row band
+	selStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	worktreeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
+	goneStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	headerStyle   = lipgloss.NewStyle().Bold(true)
+	okStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 
 	nameStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("14")) // cyan
 	hashStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))  // yellow
@@ -1692,9 +1693,14 @@ func (m model) renderRow(br branch, nameW int, isCursor bool) string {
 	if br.deleteRemote {
 		rem = errStyle.Render("R")
 	}
+	// The checkout column follows `git branch`: * for the branch checked out
+	// here, + for one checked out in another worktree.
 	cur := " "
-	if br.isCurrent {
+	switch {
+	case br.isCurrent:
 		cur = currentStyle.Render("*")
+	case br.worktree != "":
+		cur = worktreeStyle.Render("+")
 	}
 
 	name := pad(truncate(br.name, nameW), nameW)
@@ -1836,6 +1842,7 @@ func (m model) helpView() string {
 	b.WriteString("\n")
 	writeRows([][2]string{
 		{"*", "current branch (cannot be deleted)"},
+		{"+", "checked out in another worktree (removed on delete)"},
 		{"[x]", "selected for deletion"},
 		{"R", "its remote branch will also be deleted"},
 		{"↑/↓", "commits ahead of / behind upstream"},
@@ -1845,7 +1852,10 @@ func (m model) helpView() string {
 
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("Gone branches are deleted with -D. Any holding commits that are not in\n" +
-		"the default branch are left unselected by x/p and flagged on the confirm screen."))
+		"the default branch are left unselected by x/p and flagged on the confirm screen.\n" +
+		"A branch checked out in a linked worktree is deleted after its worktree is removed;\n" +
+		"safe mode refuses a worktree with uncommitted changes, force mode discards them.\n" +
+		"A branch checked out in the main worktree cannot be deleted."))
 	b.WriteString("\n\n")
 
 	commit, date := buildInfo()
@@ -1901,6 +1911,9 @@ func (m model) confirmParts() (header, body, footer []string) {
 		if br.deleteRemote && br.upstream != "" {
 			body = append(body, "      "+errStyle.Render(fmt.Sprintf("+ delete remote %s/%s", br.remoteName(), br.remoteBranch())))
 		}
+		if w := m.worktreeWarning(br); w != "" {
+			body = append(body, "      "+errStyle.Render(w))
+		}
 		if w := m.riskWarning(br); w != "" {
 			body = append(body, "      "+errStyle.Render(w))
 		}
@@ -1917,6 +1930,23 @@ func (m model) confirmParts() (header, body, footer []string) {
 }
 
 func (m model) confirmView() string { return m.page(m.confirmParts()) }
+
+// worktreeWarning states what deleting br does to the worktree that holds it,
+// or "" when no worktree does. git refuses to delete a branch a worktree has
+// checked out, so the worktree is removed first.
+func (m model) worktreeWarning(br branch) string {
+	if br.worktree == "" {
+		return ""
+	}
+	if m.force {
+		return "+ remove worktree " + br.worktree + " (uncommitted changes will be lost)"
+	}
+	if br.forcedDelete(false) || br.safeDeletable() {
+		return "+ remove worktree " + br.worktree + " (refused if it has uncommitted changes)"
+	}
+	// -d will refuse the branch, so the worktree stays until the force retry.
+	return "+ remove worktree " + br.worktree + " if you then force delete"
+}
 
 // riskWarning states the cost of deleting br, or "" when the delete is clean.
 // It covers every branch git's safe delete would refuse plus gone branches,
@@ -1969,6 +1999,9 @@ func (m model) forcePromptParts() (header, body, footer []string) {
 		if r.remoteSkipped {
 			body = append(body, "      "+errStyle.Render(fmt.Sprintf("+ remote %s/%s will be deleted once the branch is gone", r.br.remoteName(), r.br.remoteBranch())))
 		}
+		if r.br.worktree != "" && !r.worktreeRemoved {
+			body = append(body, "      "+errStyle.Render("+ worktree "+r.br.worktree+" will be removed first"))
+		}
 	}
 
 	footer = []string{
@@ -1983,6 +2016,9 @@ func (m model) forcePromptView() string { return m.page(m.forcePromptParts()) }
 // appendResultLines adds one completed deletion result (local, then remote if
 // tried) to dst. Shared by the results screen and the live deleting screen.
 func appendResultLines(dst []string, r deleteResult) []string {
+	if r.worktreeRemoved {
+		dst = append(dst, okStyle.Render("  ✓ ")+"removed worktree "+r.br.worktree)
+	}
 	if r.localOK {
 		dst = append(dst, okStyle.Render("  ✓ ")+"deleted local "+r.br.name)
 	} else {
