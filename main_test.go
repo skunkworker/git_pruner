@@ -2771,3 +2771,206 @@ func TestDiffRerendersOnResize(t *testing.T) {
 		t.Fatalf("the view must show delta's lines and name it:\n%s", o)
 	}
 }
+
+// result returns m's deletion result for the named branch, failing if none ran.
+func result(t *testing.T, m model, name string) deleteResult {
+	t.Helper()
+	for _, r := range m.results {
+		if r.br.name == name {
+			return r
+		}
+	}
+	t.Fatalf("no deletion result for %s: %+v", name, m.results)
+	return deleteResult{}
+}
+
+// confirmBody returns the body lines of m's confirmation screen.
+func (m model) confirmBody() []string {
+	_, body, _ := m.confirmParts()
+	return body
+}
+
+// realTempDir is t.TempDir with symlinks resolved, so its paths match the
+// ones git reports (macOS puts temp dirs under /var, a link to /private/var).
+func realTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// dirExists reports whether path is present on disk.
+func dirExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// git refuses to delete a branch any worktree has checked out, under -d and -D
+// alike, so the delete has to remove the worktree first. That holds for a
+// worktree whose directory was deleted by hand too: git still records it until
+// it is pruned.
+func TestWorktreeBranchDeletes(t *testing.T) {
+	repo := setupLocalRepo(t)
+	chdir(t, repo)
+	git(t, repo, "branch", "feature/stale")
+	wt := filepath.Join(realTempDir(t), "wt")
+	stale := filepath.Join(realTempDir(t), "stale")
+	git(t, repo, "worktree", "add", "-q", wt, "feature/merged")
+	git(t, repo, "worktree", "add", "-q", stale, "feature/stale")
+	if err := os.RemoveAll(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"feature/merged", "feature/stale"} {
+		b := find(m.branches, name)
+		if b.worktree == "" || b.mainWorktree {
+			t.Fatalf("precondition: %s should be held by a linked worktree: %+v", name, b)
+		}
+		b.selected = true
+	}
+	m.force = false
+	m = startAndDrain(t, m, false)
+
+	wantState(t, m, stateResult, "both deletes should succeed")
+	for _, name := range []string{"feature/merged", "feature/stale"} {
+		if r := result(t, m, name); !r.worktreeRemoved || !r.localOK {
+			t.Fatalf("%s: want worktree removed and branch deleted: %+v", name, r)
+		}
+		if find(m.branches, name) != nil {
+			t.Fatalf("%s should be gone after the delete", name)
+		}
+	}
+	if dirExists(wt) {
+		t.Fatal("the worktree directory should be removed")
+	}
+	if out := git(t, repo, "worktree", "list", "--porcelain"); strings.Contains(out, "feature/") {
+		t.Fatalf("git should no longer record either worktree:\n%s", out)
+	}
+	if body := strings.Join(appendResultLines(nil, result(t, m, "feature/merged")), "\n"); !strings.Contains(body, "removed worktree "+wt) {
+		t.Fatalf("the results must name the removed worktree:\n%s", body)
+	}
+}
+
+// A worktree with uncommitted work survives a safe delete, and the branch with
+// it; force mode is the user's say-so to discard that work.
+func TestDirtyWorktreeNeedsForce(t *testing.T) {
+	repo := setupLocalRepo(t)
+	chdir(t, repo)
+	wt := filepath.Join(realTempDir(t), "wt")
+	git(t, repo, "worktree", "add", "-q", wt, "feature/merged")
+	if err := os.WriteFile(filepath.Join(wt, "scratch"), []byte("unsaved work"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	find(m.branches, "feature/merged").selected = true
+	m.force = false
+	if body := strings.Join(m.confirmBody(), "\n"); !strings.Contains(body, "remove worktree "+wt+" (refused if it has uncommitted changes)") {
+		t.Fatalf("the safe confirm must say the worktree goes only if clean:\n%s", body)
+	}
+	m = startAndDrain(t, m, false)
+
+	wantState(t, m, stateResult, "a dirty worktree is not a force-prompt case")
+	if r := result(t, m, "feature/merged"); r.localOK || r.worktreeRemoved || !strings.Contains(r.localErr, wt) {
+		t.Fatalf("safe mode must refuse the dirty worktree and name it: %+v", r)
+	}
+	if !dirExists(filepath.Join(wt, "scratch")) || find(m.branches, "feature/merged") == nil {
+		t.Fatal("the worktree, its files and the branch must all survive a refused delete")
+	}
+
+	find(m.branches, "feature/merged").selected = true
+	m.force = true
+	if body := strings.Join(m.confirmBody(), "\n"); !strings.Contains(body, "uncommitted changes will be lost") {
+		t.Fatalf("the force confirm must warn that changes are discarded:\n%s", body)
+	}
+	m = startAndDrain(t, m, false)
+	if r := result(t, m, "feature/merged"); !r.localOK || !r.worktreeRemoved {
+		t.Fatalf("force mode should remove the dirty worktree and the branch: %+v", r)
+	}
+	if dirExists(wt) {
+		t.Fatal("the worktree directory should be removed under force")
+	}
+}
+
+// When -d is going to refuse the branch as unmerged, removing its worktree
+// first would leave the user with neither: the branch survives, the worktree
+// does not. The worktree stays until the user accepts the force retry.
+func TestUnmergedWorktreeKeptUntilForce(t *testing.T) {
+	repo := setupLocalRepo(t)
+	chdir(t, repo)
+	wt := filepath.Join(realTempDir(t), "wt")
+	git(t, repo, "worktree", "add", "-q", wt, "feature/unmerged")
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	find(m.branches, "feature/unmerged").selected = true
+	m.force = false
+	m = startAndDrain(t, m, false)
+
+	wantState(t, m, stateForcePrompt, "an unmerged branch must still raise the force prompt")
+	if r := result(t, m, "feature/unmerged"); r.worktreeRemoved || !r.forceable {
+		t.Fatalf("the worktree must be kept and the delete forceable: %+v", r)
+	}
+	if !dirExists(wt) {
+		t.Fatal("the worktree must survive the refused -d")
+	}
+	if _, body, _ := m.forcePromptParts(); !strings.Contains(strings.Join(body, "\n"), "worktree "+wt+" will be removed first") {
+		t.Fatalf("the force prompt must name the worktree it removes:\n%s", strings.Join(body, "\n"))
+	}
+
+	m = press(t, m, key("y"))
+	if r := result(t, m, "feature/unmerged"); !r.localOK || !r.worktreeRemoved {
+		t.Fatalf("the force retry should remove the worktree and the branch: %+v", r)
+	}
+	if dirExists(wt) || find(m.branches, "feature/unmerged") != nil {
+		t.Fatal("the worktree and the branch should both be gone after the force retry")
+	}
+}
+
+// Run from a linked worktree, the branch checked out in the main worktree is as
+// undeletable as the current one: git cannot remove the main worktree to free it.
+func TestMainWorktreeBranchCannotBeMarked(t *testing.T) {
+	repo := setupLocalRepo(t)
+	addOrigin(t, repo, "main")
+	git(t, repo, "push", "-q", "-u", "origin", "feature/merged")
+	git(t, repo, "branch", "-q", "-u", "origin/feature/merged", "main")
+	git(t, repo, "push", "-q", "origin", "--delete", "feature/merged")
+	git(t, repo, "fetch", "-q", "--prune")
+	wt := filepath.Join(realTempDir(t), "wt")
+	git(t, repo, "worktree", "add", "-q", wt, "feature/unmerged")
+	chdir(t, wt)
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := find(m.branches, "main")
+	if b == nil || !b.mainWorktree || b.isCurrent {
+		t.Fatalf("precondition: main should be held by the main worktree: %+v", b)
+	}
+	for i := range m.branches {
+		if m.branches[i].name == "main" {
+			m.cursor = i
+		}
+	}
+	m = press(t, m, key(" "), key("a"), key("x"))
+	for _, b := range m.selectedBranches() {
+		if b.name == "main" || b.isCurrent {
+			t.Fatalf("%s must not be selectable from a linked worktree", b.name)
+		}
+	}
+	if row := m.renderRow(*find(m.branches, "main"), 12, false); !strings.Contains(row, worktreeStyle.Render("+")) {
+		t.Fatalf("a branch held by another worktree must show the + marker:\n%q", row)
+	}
+}
