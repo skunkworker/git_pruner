@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -34,15 +35,19 @@ type branch struct {
 	gone         bool // upstream was configured but no longer exists
 	remoteMerged bool // upstream is merged into the remote default branch (safe to delete)
 	headMerged   bool // branch tip is merged into HEAD (git's -d criterion when there is no upstream)
-	riskCommits  int  // commits whose patch is not in the base branch; -D discards them
+	riskCommits  int  // commits whose patch is not in the base branch; -D discards them (riskUnknown: not countable)
 	riskMeasured bool // riskCommits has been computed (0 is a meaningful value)
 	isCurrent    bool
 	worktree     string // path of another worktree that has the branch checked out; "" when none does
 	mainWorktree bool   // that worktree is the main one, which git cannot remove
-	protected    bool   // matches the default branch or a pruner.protect pattern
-	remoteOnly   bool   // a remote branch that no local branch tracks
-	selected     bool
-	deleteRemote bool
+	// heldBy names the operation in progress that holds the branch, "rebase" or
+	// "bisect"; "" when none does. git refuses to delete a held branch.
+	heldBy          string
+	protected       bool // matches the default branch or a pruner.protect pattern
+	remoteProtected bool // its remote branch is the trunk or matches a pruner.protect pattern
+	remoteOnly      bool // a remote branch that no local branch tracks
+	selected        bool
+	deleteRemote    bool
 }
 
 // remoteArmed reports whether deleting b includes its remote branch. Selecting
@@ -52,7 +57,28 @@ func (b branch) remoteArmed() bool { return (b.deleteRemote || b.remoteOnly) && 
 // locked reports whether b can never be marked for deletion. A branch in a
 // linked worktree is not: the delete removes the worktree first. The main
 // worktree cannot be removed, so its branch stays locked.
-func (b branch) locked() bool { return b.isCurrent || b.mainWorktree || b.protected }
+func (b branch) locked() bool { return b.isCurrent || b.mainWorktree || b.heldBy != "" || b.protected }
+
+// remoteDeletable reports whether r may arm the delete of b's remote branch. An
+// upstream that is a local branch (remote ".") has no remote branch at all, and
+// remoteName would guess a remote b never used.
+func (b branch) remoteDeletable() bool {
+	return b.upstream != "" && b.upRemote != "." && !b.remoteOnly && !b.locked() && !b.remoteProtected
+}
+
+// remoteRefusal says why r cannot arm b's remote delete, for the cases the row
+// does not already show.
+func (b branch) remoteRefusal() string {
+	switch {
+	case b.remoteOnly || b.locked() || b.upstream == "":
+		return ""
+	case b.upRemote == ".":
+		return b.name + " tracks local branch " + b.upstream + ": there is no remote branch to delete"
+	case b.remoteProtected:
+		return "remote branch " + b.remoteName() + "/" + b.remoteBranch() + " is protected"
+	}
+	return ""
+}
 
 // ref is b's fully qualified ref (see branchRef).
 func (b branch) ref() string {
@@ -130,8 +156,24 @@ var (
 // It is what picks the cap, so a new network subcommand belongs here rather than
 // at its call site.
 func networkBound(args []string) bool {
-	return len(args) > 0 && (args[0] == "push" || args[0] == "fetch")
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "push", "fetch":
+		return true
+	case "cherry", "diff":
+		// Both read file contents, which a partial clone fetches on demand.
+		// Killing either on the timeout is safe: they change nothing.
+		return lazyFetch.Load()
+	}
+	return false
 }
+
+// lazyFetch records that the repository is a partial clone (git clone
+// --filter), which fetches missing file contents from its remote on demand.
+// loadRepo sets it on every load.
+var lazyFetch atomic.Bool
 
 // gauge records the highest number of concurrent holders it has seen. It sits on
 // the subprocesses rather than on the slots, so a test can tell a cap that works
@@ -455,6 +497,11 @@ func baseBranch(name string) string {
 // Returns 0 when there is nothing to compare against.
 func riskCommitCount(name, base string) int { return riskCommitCountRef(branchRef(name), base) }
 
+// riskUnknown is the count of a branch git cherry could not measure. A partial
+// clone that cannot reach its remote fails there, and reading the failure as 0
+// would let x and p select a branch whose commits -D then discards.
+const riskUnknown = -1
+
 // riskCommitCountRef is riskCommitCount for any fully qualified ref, which is
 // what lets a remote branch be measured the same way.
 func riskCommitCountRef(ref, base string) int {
@@ -463,7 +510,7 @@ func riskCommitCountRef(ref, base string) int {
 	}
 	out, err := runGit("cherry", base, ref)
 	if err != nil {
-		return 0
+		return riskUnknown
 	}
 	n := 0
 	for _, line := range strings.Split(out, "\n") {
@@ -510,23 +557,45 @@ func localMergedSet() map[string]bool { return mergedSet("branch", "--merged", "
 type repoReads struct {
 	headMerged map[string]bool // local branches merged into HEAD
 	remotes    remoteRefs
-	config     prunerConfig
+	config     repoConfig
 }
 
-// prunerConfig is the tool's own git config, under the pruner.* section.
-type prunerConfig struct {
-	protect   []string // pruner.protect: branch name globs that can never be marked
-	staleDays int      // pruner.staleDays: the default age for the merged-and-old rule
+// repoConfig is the git config the tool reads: its own pruner.* section, and
+// the remote settings that decide what a remote delete targets and which git
+// commands can reach the network.
+type repoConfig struct {
+	protect      []string    // pruner.protect: branch name globs that can never be marked
+	staleDays    int         // pruner.staleDays: the default age for the merged-and-old rule
+	fetch        []fetchSpec // remote.<name>.fetch, in config order
+	partialClone bool        // a remote is a promisor: git fetches missing objects on demand
+}
+
+// fetchSpec is one remote.<name>.fetch refspec: src names refs on the remote,
+// dst the tracking refs they are fetched into. Each may hold one "*".
+type fetchSpec struct{ remote, src, dst string }
+
+// srcFor maps a tracking ref back to the remote ref s fetches into it.
+func (s fetchSpec) srcFor(ref string) (string, bool) {
+	pre, post, glob := strings.Cut(s.dst, "*")
+	if !glob {
+		return s.src, ref == s.dst
+	}
+	if len(ref) < len(pre)+len(post) || !strings.HasPrefix(ref, pre) || !strings.HasSuffix(ref, post) {
+		return "", false
+	}
+	return strings.Replace(s.src, "*", ref[len(pre):len(ref)-len(post)], 1), true
 }
 
 // defaultStaleDays is the age the merged-and-old rule starts from.
 const defaultStaleDays = 90
 
-// loadConfig reads every pruner.* key in one call. Unset is the usual case, and
-// git exits 1 for it, so an error only means "use the defaults".
-func loadConfig() prunerConfig {
-	c := prunerConfig{staleDays: defaultStaleDays}
-	out, _ := runGit("config", "--get-regexp", `^pruner\.`)
+// loadConfig reads every key repoConfig needs in one call. Unset is the usual
+// case for pruner.*, and git exits 1 when nothing matches, so an error only
+// means "use the defaults". git lowercases section and key names, but not the
+// remote's name between them.
+func loadConfig() repoConfig {
+	c := repoConfig{staleDays: defaultStaleDays}
+	out, _ := runGit("config", "--get-regexp", `^(pruner|remote)\.|^extensions\.partialclone$`)
 	for _, line := range strings.Split(out, "\n") {
 		key, val, _ := strings.Cut(strings.TrimSpace(line), " ")
 		switch key {
@@ -536,9 +605,66 @@ func loadConfig() prunerConfig {
 			if n, err := strconv.Atoi(val); err == nil && n >= 0 {
 				c.staleDays = n
 			}
+		case "extensions.partialclone":
+			c.partialClone = true
+		}
+		remote, ok := strings.CutPrefix(key, "remote.")
+		if !ok {
+			continue
+		}
+		if name, ok := strings.CutSuffix(remote, ".promisor"); ok && name != "" && gitBool(val) {
+			c.partialClone = true
+		}
+		// A negative refspec (^) only excludes, and one with no ":" fetches into
+		// no tracking ref.
+		if name, ok := strings.CutSuffix(remote, ".fetch"); ok && !strings.HasPrefix(val, "^") {
+			if src, dst, ok := strings.Cut(strings.TrimPrefix(val, "+"), ":"); ok {
+				c.fetch = append(c.fetch, fetchSpec{remote: name, src: src, dst: dst})
+			}
 		}
 	}
 	return c
+}
+
+// gitBool reads a config value the way git reads a boolean. A key with no
+// value at all is true.
+func gitBool(val string) bool {
+	switch strings.ToLower(val) {
+	case "", "true", "yes", "on", "1":
+		return true
+	}
+	return false
+}
+
+// mapRemoteRows points each remote row at the branch it tracks on its remote,
+// read back through the fetch refspecs, and drops the rows that track no one
+// remote branch. A tracking ref's name is only a convention: with the refspec
+// refs/heads/jb/*:refs/remotes/origin/*, origin/x tracks jb/x, and a delete
+// pushed for x would remove someone else's branch. Refs fetched from outside
+// refs/heads/, such as pull request heads, are not branches a push can delete.
+// When two refspecs map a ref back to different sources, which one fetched it
+// cannot be told locally: the usual pull request refspec next to the default
+// one maps origin/pr/1 back to both refs/pull/1/head and refs/heads/pr/1.
+func mapRemoteRows(rows []branch, specs []fetchSpec) []branch {
+	var out []branch
+	for _, r := range rows {
+		ref := r.ref()
+		var remote, src string
+		n := 0 // distinct sources the ref maps back to
+		for _, s := range specs {
+			got, ok := s.srcFor(ref)
+			if !ok || (n > 0 && remote == s.remote && src == got) {
+				continue
+			}
+			remote, src = s.remote, got
+			n++
+		}
+		if n == 1 && strings.HasPrefix(src, "refs/heads/") {
+			r.upRemote, r.upMerge = remote, src
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // loadRepo reads the branch list and everything independent of it in one round.
@@ -551,17 +677,23 @@ func loadRepo(withRemote bool) ([]branch, repoReads, error) {
 		err      error
 		reads    repoReads
 		mainWT   string
+		held     map[string]string
 	)
 	var wg sync.WaitGroup
-	wg.Add(5)
+	wg.Add(6)
 	go func() { defer wg.Done(); branches, err = loadBranches() }()
 	go func() { defer wg.Done(); reads.headMerged = localMergedSet() }()
 	go func() { defer wg.Done(); reads.remotes = loadRemoteRefs(withRemote) }()
 	go func() { defer wg.Done(); reads.config = loadConfig() }()
 	go func() { defer wg.Done(); mainWT = mainWorktreePath() }()
+	go func() { defer wg.Done(); held = loadHeldBranches() }()
 	wg.Wait()
+	lazyFetch.Store(reads.config.partialClone)
+	reads.remotes.rows = mapRemoteRows(reads.remotes.rows, reads.config.fetch)
 	for i := range branches {
-		branches[i].mainWorktree = mainWT != "" && branches[i].worktree == mainWT
+		b := &branches[i]
+		b.mainWorktree = mainWT != "" && b.worktree == mainWT
+		b.heldBy = held[b.ref()]
 	}
 	return branches, reads, err
 }
@@ -578,6 +710,62 @@ func mainWorktreePath() string {
 		return path
 	}
 	return ""
+}
+
+// loadHeldBranches finds the branches that a rebase or bisect in progress holds,
+// in any worktree, mapping each full ref to the operation's name. git refuses
+// to delete such a branch under -d and -D alike, yet %(worktreepath) does not
+// report it: the worktree's HEAD is detached while the operation runs. Each
+// worktree keeps this state in its own git dir: the common dir for the main
+// worktree, and worktrees/<id> under it for each linked one.
+func loadHeldBranches() map[string]string {
+	out, err := runGit("rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return nil
+	}
+	common := strings.TrimSpace(out)
+	linked, _ := filepath.Glob(filepath.Join(common, "worktrees", "*"))
+	held := map[string]string{}
+	for _, dir := range append([]string{common}, linked...) {
+		readHeld(dir, held)
+	}
+	return held
+}
+
+// readHeld adds the branches held in one worktree's git dir. It follows git's
+// own list (prepare_checked_out_branches in branch.c).
+func readHeld(dir string, held map[string]string) {
+	read := func(name string) string {
+		data, _ := os.ReadFile(filepath.Join(dir, name))
+		return strings.TrimSpace(string(data))
+	}
+	// A rebase started from a detached HEAD writes "detached HEAD" here.
+	for _, f := range []string{"rebase-merge/head-name", "rebase-apply/head-name"} {
+		if ref := read(f); strings.HasPrefix(ref, "refs/heads/") {
+			held[ref] = "rebase"
+		}
+	}
+	// rebase --update-refs lists each branch it will move, as a ref followed by
+	// its old and new commit.
+	lines := strings.Split(read("rebase-merge/update-refs"), "\n")
+	for i := 0; i < len(lines); i += 3 {
+		if strings.HasPrefix(lines[i], "refs/heads/") {
+			held[lines[i]] = "rebase"
+		}
+	}
+	// BISECT_START names the branch bisect started from, or holds a commit ID
+	// when it started from a detached HEAD.
+	if start := read("BISECT_START"); start != "" && !isObjectID(start) {
+		held[branchRef(start)] = "bisect"
+	}
+}
+
+// isObjectID reports whether s is a full SHA-1 or SHA-256 object ID.
+func isObjectID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	return strings.Trim(s, "0123456789abcdef") == ""
 }
 
 // loadDiff returns the patch introduced on name relative to its merge-base with

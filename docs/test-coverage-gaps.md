@@ -176,6 +176,66 @@ Combined with a multibyte branch name, pinned end to end through parse, render, 
 
 ---
 
+## Tier 4 — git state outside the branch list — **DONE 2026-10-09**
+
+The linked-worktree bug (`bugs.md`, October 5) had one cause: git keeps state outside
+`refs/heads` that changes what a delete does, and the tool did not read it. This sweep looked
+for more of that shape. Every claim was reproduced in a throwaway repo first.
+
+### 15. Rebase, bisect and `rebase --update-refs` hold branches *(confirmed — fixed)*
+
+git refuses `branch -d` and `-D` on a branch a rebase or bisect started from, in any worktree,
+and on every branch a `rebase --update-refs` will move. The worktree's HEAD is detached, so
+`%(HEAD)` and `%(worktreepath)` are both empty and the tool showed the branch as free. Fixed by
+`loadHeldBranches`, which reads each worktree's `rebase-merge/head-name`,
+`rebase-apply/head-name`, `rebase-merge/update-refs` and `BISECT_START`, following git's
+`prepare_checked_out_branches`. Held branches show `~` and are locked.
+*(`TestHeldBranchesAreLocked`)*
+
+### 16. `r` armed the delete of the wrong remote branch *(confirmed — fixed)*
+
+`r` targets the upstream, which need not share the branch's name. Reproduced:
+
+- `hotfix` made from `origin/release/1.0` with `pruner.protect 'release/*'`: the push deleted
+  `release/1.0`. The protect check only looked at the local name.
+- `git switch -c feat origin/main`: the push tried to delete `main`. Only the remote's own
+  `receive.denyDeleteCurrent` stopped it.
+- `--track main` (remote `.`): `remoteName` fell back to `origin`, so the push tried to delete
+  `origin`'s `main`, a remote the branch never used.
+
+Fixed by `remoteProtected` (trunk and protect checks on `remoteBranch()`) and
+`remoteDeletable()`, which also refuses a local upstream. *(`TestRemoteDeleteRefusesWrongTargets`)*
+
+### 17. Remote rows ignored fetch refspecs *(confirmed — fixed)*
+
+With `+refs/heads/jb/*:refs/remotes/origin/*`, the row `origin/old` is `jb/old` on the remote,
+but the delete pushed `refs/heads/old` and removed a teammate's branch. `mapRemoteRows` now maps
+each row back through `remote.<name>.fetch`. Rows that map to no branch, or to more than one
+source (the usual pull request refspec next to the default one), are dropped. Every remote's
+trunk is now protected in the remote view, not only the default remote's.
+*(`TestRemoteRowsFollowFetchRefspecs`)*
+
+### 18. Partial clones reach the network from `cherry` and `diff` *(confirmed — fixed)*
+
+In a `--filter=blob:none` clone, `git cherry` fetches blobs when two commits touch the same
+files, and `git diff` fetches them for the `v` view. `runGit` treated both as local: no
+timeout and no ssh prompt guard. Worse, with the remote unreachable `cherry` exits 128, and
+`riskCommitCountRef` read that as **zero** commits at risk, so `x` selected a gone branch whose
+unique commit `-D` then discarded. Fixed by `lazyFetch` (set from `remote.*.promisor` or
+`extensions.partialClone`), which makes both commands network-bound, and by `riskUnknown`,
+which `x`, `p` and the confirm screens treat as risky. *(`TestPartialCloneRiskIsNotGuessed`)*
+
+`git switch` (`c`) also fetches in a partial clone, but stays local: the 60 s timeout would
+kill a checkout partway and leave `index.lock` behind.
+
+### Checked, no change needed
+
+- Worktree folder deleted by hand: `git worktree remove --force` still succeeds.
+- Bare repo with worktrees: its HEAD branch shows `*` and is locked, though git would delete
+  it. The safe side.
+- `git am` in progress: HEAD stays on the branch, so it already shows as current.
+- Locked worktree: the remove is refused as designed.
+
 ## Ref handling — the rule this work established
 
 **Never use git's `%(refname:short)`, `%(upstream:short)`, or `symbolic-ref --short`.** They

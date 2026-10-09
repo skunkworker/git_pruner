@@ -331,6 +331,8 @@ func (m model) renderRow(br branch, nameW int, isCursor bool) string {
 		cur = currentStyle.Render("*")
 	case br.worktree != "":
 		cur = hunkStyle.Render("+")
+	case br.heldBy != "":
+		cur = goneStyle.Render("~")
 	case br.protected:
 		cur = dimStyle.Render("P")
 	}
@@ -365,7 +367,11 @@ func (m model) renderRow(br branch, nameW int, isCursor bool) string {
 		row += " " + hashStyle.Render(fmt.Sprintf("%-8s", br.hash))
 	}
 	if c.subject > 0 {
-		row += " " + subjectStyle.Render(truncate(br.subject, c.subject))
+		subject := br.subject
+		if br.heldBy != "" {
+			subject = br.heldBy + " in progress · " + subject
+		}
+		row += " " + subjectStyle.Render(truncate(subject, c.subject))
 	}
 	// Last guard against a wrap on a terminal too narrow for even the fixed columns.
 	row = ansi.Truncate(row, max(1, m.width), "")
@@ -536,6 +542,7 @@ func (m model) helpView() string {
 	writeRows([][2]string{
 		{"* / P", "current / protected (locked)"},
 		{"+", "in another worktree (removed on delete; locked if the main one)"},
+		{"~", "held by a rebase or bisect in progress (locked)"},
 		{"[x]", "selected for deletion"},
 		{"R", "its remote branch will also be deleted"},
 		{"↑/↓", "commits ahead of / behind upstream"},
@@ -658,8 +665,8 @@ func (m model) worktreeWarning(br branch) string {
 // discarded, under -d the delete simply fails.
 func (m model) riskWarning(br branch) string {
 	if br.remoteOnly {
-		if br.riskCommits > 0 {
-			return fmt.Sprintf("⚠ %d commit(s) not in %s — this may be the only shared copy of them", br.riskCommits, m.riskBase)
+		if br.riskCommits != 0 {
+			return fmt.Sprintf("⚠ %s — this may be the only shared copy of them", m.riskCount(br))
 		}
 		return ""
 	}
@@ -667,8 +674,8 @@ func (m model) riskWarning(br branch) string {
 		return ""
 	}
 	if br.forcedDelete(m.force) { // -D: the question is what gets discarded
-		if br.riskCommits > 0 {
-			return fmt.Sprintf("⚠ %d commit(s) not in %s — force delete (-D) will discard them", br.riskCommits, m.riskBase)
+		if br.riskCommits != 0 {
+			return fmt.Sprintf("⚠ %s — force delete (-D) will discard them", m.riskCount(br))
 		}
 		if m.riskBase == "" {
 			return "⚠ no base branch to compare against — force delete (-D) discards any unmerged commits"
@@ -676,10 +683,20 @@ func (m model) riskWarning(br branch) string {
 		return "" // measured against a real base: nothing here is at risk
 	}
 	// -d will be refused either way; the count is what a force would then cost.
-	if br.riskCommits > 0 {
-		return fmt.Sprintf("⚠ not fully merged: %d commit(s) not in %s — safe delete (-d) will fail; use force (f)", br.riskCommits, m.riskBase)
+	if br.riskCommits != 0 {
+		return fmt.Sprintf("⚠ not fully merged: %s — safe delete (-d) will fail; use force (f)", m.riskCount(br))
 	}
 	return "⚠ not fully merged — safe delete (-d) will fail; use force (f)"
+}
+
+// riskCount phrases br's risk count for a warning. A count git cherry could not
+// take (riskUnknown) is nonzero on purpose, so every warning that tests for
+// commits at risk also speaks for it.
+func (m model) riskCount(br branch) string {
+	if br.riskCommits == riskUnknown {
+		return "an unknown number of commits not in " + m.riskBase
+	}
+	return fmt.Sprintf("%d commit(s) not in %s", br.riskCommits, m.riskBase)
 }
 
 func (m model) forcePromptParts() (header, body, footer []string) {
@@ -701,8 +718,8 @@ func (m model) forcePromptParts() (header, body, footer []string) {
 		// ran: riskCommits == 0 means either nothing is missing from the base or
 		// there was no base to measure against.
 		switch {
-		case r.br.riskCommits > 0:
-			body = append(body, "      "+errStyle.Render(fmt.Sprintf("⚠ %d commit(s) not in %s will be lost", r.br.riskCommits, m.riskBase)))
+		case r.br.riskCommits != 0:
+			body = append(body, "      "+errStyle.Render(fmt.Sprintf("⚠ %s will be lost", m.riskCount(r.br))))
 		case m.riskBase == "":
 			body = append(body, "      "+errStyle.Render("⚠ no base branch to compare against — unmerged commits may be lost"))
 		default:
