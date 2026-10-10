@@ -99,7 +99,9 @@ func wantState(t *testing.T, m model, want viewState, why string) {
 	}
 }
 
-// remoteHasBranch reports whether origin still has the named branch.
+// remoteHasBranch reports whether origin still has the named branch. ls-remote
+// matches a short name against the end of every ref, so "old" also finds
+// jb/old; pass a full ref such as refs/heads/old to match one branch only.
 func remoteHasBranch(t *testing.T, dir, name string) bool {
 	t.Helper()
 	return git(t, dir, "ls-remote", "--heads", "origin", name) != ""
@@ -2984,5 +2986,233 @@ func TestMainWorktreeBranchCannotBeMarked(t *testing.T) {
 	}
 	if row := m.renderRow(*find(m.branches, "main"), 12, false); !strings.Contains(stripANSI(row), " + main") {
 		t.Fatalf("a branch held by another worktree must show the + marker:\n%q", row)
+	}
+}
+
+// gitStops runs a git command that is expected to stop partway, such as a
+// rebase that hits a conflict.
+func gitStops(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("git %s should have stopped partway:\n%s", strings.Join(args, " "), out)
+	}
+}
+
+// A rebase or bisect holds the branch it started from, and a rebase
+// --update-refs holds every branch in its stack. git refuses to delete them in
+// any worktree, under -d and -D alike, yet the worktree's HEAD is detached, so
+// neither %(HEAD) nor %(worktreepath) reports them.
+func TestHeldBranchesAreLocked(t *testing.T) {
+	repo := initRepo(t, "main")
+	commitFile(t, repo, "f", "a")
+	for _, name := range []string{"stack/base", "stack/top", "bisected", "applied"} {
+		git(t, repo, "branch", name)
+	}
+	commitFile(t, repo, "f", "main")
+
+	// Main worktree: a rebase --update-refs that stops on its second commit.
+	git(t, repo, "switch", "-q", "stack/base")
+	commitFile(t, repo, "g", "base")
+	git(t, repo, "switch", "-q", "-C", "stack/top")
+	commitFile(t, repo, "f", "top")
+	gitStops(t, repo, "rebase", "--update-refs", "main")
+
+	// Linked worktrees: a bisect, and a rebase on the apply backend.
+	bisectWT := filepath.Join(realTempDir(t), "bisect")
+	git(t, repo, "worktree", "add", "-q", bisectWT, "bisected")
+	commitFile(t, bisectWT, "h", "1")
+	commitFile(t, bisectWT, "h", "2")
+	git(t, bisectWT, "bisect", "start", "bisected", "main")
+	applyWT := filepath.Join(realTempDir(t), "apply")
+	git(t, repo, "worktree", "add", "-q", applyWT, "applied")
+	commitFile(t, applyWT, "f", "applied")
+	gitStops(t, applyWT, "rebase", "--apply", "main")
+
+	want := map[string]string{"stack/base": "rebase", "stack/top": "rebase", "bisected": "bisect", "applied": "rebase"}
+	for name := range want {
+		cmd := exec.Command("git", "branch", "-D", name)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "used by worktree") {
+			t.Fatalf("precondition: git should refuse to delete %s: %v %s", name, err, out)
+		}
+	}
+
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, op := range want {
+		b := find(m.branches, name)
+		if b.worktree != "" || b.isCurrent {
+			t.Fatalf("precondition: git reports %s as checked out: %+v", name, b)
+		}
+		if b.heldBy != op || !b.locked() {
+			t.Fatalf("%s: heldBy=%q locked=%v, want %q and locked", name, b.heldBy, b.locked(), op)
+		}
+		row := stripANSI(m.renderRow(*b, 12, false))
+		if !strings.Contains(row, " ~ "+name) || !strings.Contains(row, op+" in progress") {
+			t.Fatalf("the row must show the ~ marker and the reason: %q", row)
+		}
+	}
+	m = press(t, m, key("a"))
+	for _, b := range m.selectedBranches() {
+		if want[b.name] != "" {
+			t.Fatalf("a must skip held branch %s", b.name)
+		}
+	}
+}
+
+// r deletes the remote branch a branch tracks, which need not share its name.
+// A branch made from origin/main tracks main, one made from a protected branch
+// tracks that branch, and one made with --track main tracks no remote branch at
+// all. None of these may be armed.
+func TestRemoteDeleteRefusesWrongTargets(t *testing.T) {
+	repo := initRepo(t, "main")
+	commitFile(t, repo, "a", "a")
+	addOrigin(t, repo, "main")
+	git(t, repo, "push", "-q", "origin", "main:release/1.0")
+	git(t, repo, "fetch", "-q")
+	git(t, repo, "config", "pruner.protect", "release/*")
+	git(t, repo, "branch", "hotfix", "origin/release/1.0")
+	git(t, repo, "branch", "feat", "origin/main")
+	git(t, repo, "branch", "--track", "stacked", "main")
+	git(t, repo, "switch", "-q", "-c", "feature/ok")
+	git(t, repo, "push", "-q", "-u", "origin", "feature/ok")
+	git(t, repo, "switch", "-q", "main")
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, why := range map[string]string{
+		"hotfix":  "remote branch origin/release/1.0 is protected",
+		"feat":    "remote branch origin/main is protected",
+		"stacked": "stacked tracks local branch main",
+	} {
+		cursorTo(t, &m, name)
+		m.status = ""
+		m = press(t, m, key("r"))
+		if b := find(m.branches, name); b.deleteRemote || b.remoteArmed() {
+			t.Fatalf("r must not arm the remote delete of %s (target %s/%s)", name, b.remoteName(), b.remoteBranch())
+		}
+		if !strings.Contains(m.status, why) {
+			t.Fatalf("%s: status %q should say %q", name, m.status, why)
+		}
+	}
+	cursorTo(t, &m, "feature/ok")
+	if m = press(t, m, key("r")); !find(m.branches, "feature/ok").deleteRemote {
+		t.Fatal("r must still arm a branch whose remote branch is its own")
+	}
+	if !remoteHasBranch(t, repo, "refs/heads/release/1.0") || !remoteHasBranch(t, repo, "refs/heads/main") {
+		t.Fatal("no remote branch should have been touched")
+	}
+}
+
+// The remote view maps each tracking ref back to its remote branch through the
+// fetch refspecs: with refs/heads/jb/*:refs/remotes/origin/*, origin/old is
+// jb/old, and a teammate's branch named old must survive its delete. Refs
+// fetched from outside refs/heads/ are not branches, so they are not listed.
+// Every remote's trunk is protected, not only the default remote's.
+func TestRemoteRowsFollowFetchRefspecs(t *testing.T) {
+	repo := initRepo(t, "main")
+	commitFile(t, repo, "a", "a")
+	addOrigin(t, repo, "main")
+	git(t, repo, "push", "-q", "origin", "main:jb/old", "main:old", "main:refs/pull/1/head")
+	git(t, repo, "config", "--replace-all", "remote.origin.fetch", "+refs/heads/jb/*:refs/remotes/origin/*")
+	git(t, repo, "config", "--add", "remote.origin.fetch", "+refs/pull/*/head:refs/remotes/origin/pr/*")
+	git(t, repo, "fetch", "-q", "--prune", "origin")
+	fork := t.TempDir()
+	git(t, fork, "init", "--bare", "-q", "-b", "main")
+	git(t, repo, "remote", "add", "fork", fork)
+	git(t, repo, "push", "-q", "fork", "main", "main:topic")
+	git(t, repo, "fetch", "-q", "fork")
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nm, cmd := m.Update(special(tea.KeyTab))
+	nm, _ = nm.(model).Update(cmd())
+	m = nm.(model)
+
+	if find(m.branches, "origin/pr/1") != nil {
+		t.Fatal("a pull request ref is not a remote branch and must not be listed")
+	}
+	if b := find(m.branches, "fork/main"); b == nil || !b.protected {
+		t.Fatalf("another remote's trunk must be protected: %+v", b)
+	}
+	if b := find(m.branches, "fork/topic"); b == nil || b.locked() || b.remoteBranch() != "topic" {
+		t.Fatalf("a remote with the default refspec maps by name: %+v", b)
+	}
+	old := find(m.branches, "origin/old")
+	if old == nil || old.remoteName() != "origin" || old.remoteBranch() != "jb/old" {
+		t.Fatalf("origin/old must map to origin's jb/old: %+v", old)
+	}
+
+	cursorTo(t, &m, "origin/old")
+	m = press(t, m, key(" "), key("d"))
+	wantState(t, m, stateConfirm, "d opens the confirm screen")
+	nm, cmd = m.Update(key("R"))
+	m = drainDeletions(t, nm.(model), cmd)
+	if r := result(t, m, "origin/old"); !r.remoteOK {
+		t.Fatalf("the delete should succeed: %+v", r)
+	}
+	if remoteHasBranch(t, repo, "refs/heads/jb/old") {
+		t.Fatal("the tracked branch jb/old should be deleted")
+	}
+	if !remoteHasBranch(t, repo, "refs/heads/old") {
+		t.Fatal("the teammate's branch old must not be deleted")
+	}
+}
+
+// A partial clone fetches file contents on demand, so git cherry can need the
+// remote. When the remote cannot be reached the count is unknown, not zero: a
+// zero would let x select a gone branch whose commit -D then discards.
+func TestPartialCloneRiskIsNotGuessed(t *testing.T) {
+	t.Cleanup(func() { lazyFetch.Store(false) })
+	src := initRepo(t, "main")
+	git(t, src, "config", "uploadpack.allowFilter", "true")
+	commitFile(t, src, "f", "a")
+	git(t, src, "branch", "feat")
+	commitFile(t, src, "f", "main")
+	// Both commits change only f, so cherry has to compare their contents.
+	git(t, src, "switch", "-q", "feat")
+	commitFile(t, src, "f", "feat")
+	git(t, src, "switch", "-q", "main")
+
+	clone := filepath.Join(t.TempDir(), "clone")
+	git(t, src, "clone", "-q", "--filter=blob:none", "--no-checkout", "file://"+src, clone)
+	git(t, clone, "branch", "-q", "feat", "origin/feat")
+	git(t, src, "branch", "-q", "-D", "feat")
+	git(t, clone, "fetch", "-q", "--prune")
+	git(t, clone, "remote", "set-url", "origin", "file://"+filepath.Join(t.TempDir(), "gone"))
+	chdir(t, clone)
+
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !networkBound([]string{"cherry"}) || !networkBound([]string{"diff"}) {
+		t.Fatal("cherry and diff can reach the remote in a partial clone")
+	}
+	b := find(m.branches, "feat")
+	if !b.gone || !b.riskMeasured || b.riskCommits != riskUnknown {
+		t.Fatalf("want a gone branch with an unknown risk count: %+v", b)
+	}
+	if status := m.selectGone(); find(m.branches, "feat").selected || !strings.Contains(status, "1 could not be checked") {
+		t.Fatalf("x must leave an unmeasured branch unselected: %q", status)
+	}
+	b.selected = true
+	if w := m.riskWarning(*b); !strings.Contains(w, "an unknown number of commits") {
+		t.Fatalf("the confirm screen must say the count is unknown: %q", w)
+	}
+
+	lazyFetch.Store(false)
+	if networkBound([]string{"cherry"}) {
+		t.Fatal("outside a partial clone, cherry is local")
 	}
 }

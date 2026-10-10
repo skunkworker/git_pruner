@@ -100,7 +100,7 @@ type model struct {
 	// can strand a remote copy, so a second press is needed.
 	abortArmed bool
 
-	config           prunerConfig
+	config           repoConfig
 	remoteDefault    string // resolved remote default branch, e.g. "origin/main"
 	remoteDefaultRef string // remoteDefault fully qualified
 	riskBase         string // ref that branch.riskCommits is measured against ("" if unresolved)
@@ -168,7 +168,10 @@ func switchCmd(b branch, withRemote bool) tea.Cmd {
 	args := []string{"switch", b.name}
 	msg := switchDoneMsg{name: b.name}
 	if b.remoteOnly {
-		msg.name, msg.fromRemote = b.remoteBranch(), true
+		// Name the local copy after the tracking ref, as git's own checkout
+		// does: a fetch refspec can give the remote's branch another name.
+		_, local, _ := strings.Cut(b.name, "/")
+		msg.name, msg.fromRemote = local, true
 		args = []string{"switch", "-c", msg.name, "--track", b.ref()}
 	}
 	return func() tea.Msg {
@@ -705,8 +708,12 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			b.selected = !b.selected
 		}
 	case "r":
-		if b := m.cur(); b != nil && b.upstream != "" && !b.locked() && !b.remoteOnly {
+		if b := m.cur(); b != nil && b.remoteDeletable() {
 			b.deleteRemote = !b.deleteRemote
+		} else if b != nil {
+			if why := b.remoteRefusal(); why != "" {
+				m.status = why
+			}
 		}
 	case "tab":
 		m.showRemote = !m.showRemote
@@ -992,8 +999,14 @@ func (m *model) installBranches(branches []branch, reads repoReads) {
 		b := &m.branches[i]
 		b.headMerged = !b.remoteOnly && reads.headMerged[b.name]
 		b.protected = m.isProtected(*b)
+		// The trunk and protect checks apply to the remote branch r would delete,
+		// not only to the local name: a branch made from origin/main tracks main.
+		b.remoteProtected = !b.remoteOnly && b.upstream != "" && m.protectsName(b.remoteBranch())
 		if b.locked() {
-			b.selected, b.deleteRemote = false, false
+			b.selected = false
+		}
+		if !b.remoteDeletable() {
+			b.deleteRemote = false
 		}
 	}
 	m.sortRows()
@@ -1020,13 +1033,16 @@ func remoteOnlyRows(local, remote []branch) []branch {
 // isProtected reports whether b is the trunk or matches a pruner.protect glob.
 // A remote row is matched by its branch part, so "release/*" covers both views.
 func (m model) isProtected(b branch) bool {
-	name := b.name
 	if b.remoteOnly {
-		if b.name == m.remoteDefault {
-			return true
-		}
-		name = b.remoteBranch()
-	} else if _, trunk, ok := strings.Cut(m.remoteDefault, "/"); b.ref() == m.riskBaseRef || (ok && name == trunk) {
+		return b.name == m.remoteDefault || m.protectsName(b.remoteBranch())
+	}
+	return m.protectsName(b.name)
+}
+
+// protectsName reports whether a branch of this name, local or on a remote, is
+// the trunk or matches a pruner.protect glob.
+func (m model) protectsName(name string) bool {
+	if _, trunk, ok := strings.Cut(m.remoteDefault, "/"); (ok && name == trunk) || branchRef(name) == m.riskBaseRef {
 		return true
 	}
 	for _, p := range m.config.protect {
@@ -1293,15 +1309,19 @@ func (m *model) applyUndo(msg undoDoneMsg) {
 // commits stay unselected so discarding them is a deliberate keystroke rather
 // than a side effect of `p` or `x`.
 func (m *model) selectGone() string {
-	gone, risky := 0, 0
+	gone, risky, unknown := 0, 0, 0
 	for i := range m.branches {
 		br := &m.branches[i]
 		if !br.gone || br.locked() {
 			continue
 		}
 		gone++
-		if br.riskCommits > 0 {
+		switch {
+		case br.riskCommits > 0:
 			risky++
+			continue
+		case br.riskCommits == riskUnknown:
+			unknown++
 			continue
 		}
 		br.selected = true
@@ -1309,12 +1329,17 @@ func (m *model) selectGone() string {
 	switch {
 	case gone == 0:
 		return "no gone branches"
-	case risky == 0:
+	case risky+unknown == 0:
 		return fmt.Sprintf("%d gone branch(es) selected; press d to prune", gone)
-	default:
-		return fmt.Sprintf("%d of %d gone branch(es) selected; %d hold commits not in %s (select with space to discard)",
-			gone-risky, gone, risky, m.riskBase)
 	}
+	msg := fmt.Sprintf("%d of %d gone branch(es) selected", gone-risky-unknown, gone)
+	if risky > 0 {
+		msg += fmt.Sprintf("; %d hold commits not in %s", risky, m.riskBase)
+	}
+	if unknown > 0 {
+		msg += fmt.Sprintf("; %d could not be checked", unknown)
+	}
+	return msg + " (select with space to discard)"
 }
 
 // merged reports whether b's work is already in the default branch. A local

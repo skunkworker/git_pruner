@@ -51,7 +51,7 @@ git_pruner version     # also --version, -v
 | `tab`          | Switch between local branches and [remote-only branches](#remote-only-branches) |
 | `c`            | Checkout the branch under the cursor (`git switch`); on a remote-only row, create a local branch that tracks it |
 | `/`            | Filter branches by name; `enter` keeps it, `esc` clears it    |
-| `r`            | Toggle "also delete remote" for the row (needs an upstream)   |
+| `r`            | Toggle "also delete remote" for the row (needs an upstream on a remote that is not [protected](#protected-branches)) |
 | `v`            | View the branch's diff (through [delta](https://github.com/dandavison/delta) when installed) |
 | `x`            | Select gone branches that hold no unique work (no fetch)      |
 | `p`            | Fetch `--all --prune`, then select gone branches that hold no unique work |
@@ -102,7 +102,8 @@ precedence, so `y`, `R` and `n` still work while a list is scrolled.
 
 - `>` cursor, `[x]` selected, `R` remote deletion armed
 - `*` current branch and `P` protected are locked; `+` checked out in another worktree (see
-  [Branches checked out in a worktree](#branches-checked-out-in-a-worktree))
+  [Branches checked out in a worktree](#branches-checked-out-in-a-worktree)); `~` held by a
+  rebase or bisect in progress (see [Branches held by a rebase or bisect](#branches-held-by-a-rebase-or-bisect))
 - ahead/behind shown as `↑N↓M` (`=` when in sync, `gone` in red when the upstream was deleted)
 - a green `✓` after the track column means the upstream is merged into the remote default
   branch — i.e. the remote is safe to delete
@@ -166,8 +167,11 @@ claiming the work is unrecoverable.
   the confirmation screen flags any commits that would be discarded (see above).
   When a `-d` delete is refused for being unmerged, a follow-up prompt lets you retry those
   branches with `-D` without leaving the results — no need to back out and re-select.
-- Remote: when armed with `r`, runs `git push <remote> --delete <branch>`, where the remote is
-  derived from the branch's upstream. Because this affects shared history, remote deletion
+- Remote: when armed with `r`, runs `git push <remote> --delete <branch>` on the branch's
+  upstream, as git records it. That upstream need not share the branch's name: a branch made
+  with `git switch -c feat origin/main` tracks `main`. So `r` refuses when the upstream is the
+  default branch or protected, and when the upstream is a local branch (`--track main`), which
+  has no remote branch to delete. Because this affects shared history, remote deletion
   requires the explicit `R` key on the confirmation screen — plain `y` deletes locals only.
   The confirmation screen also shows, per branch, whether the upstream is merged into the remote
   default (`✓ merged` / `⚠ not merged`) to help you judge whether the remote is safe to delete.
@@ -191,6 +195,13 @@ branch. The confirmation screen names each worktree it will remove.
   This happens when you run git_pruner from a linked worktree.
 - Script mode removes worktrees the same way.
 
+## Branches held by a rebase or bisect
+
+git also refuses to delete a branch that a rebase or a bisect started from, in any worktree,
+even with `-D`. A `git rebase --update-refs` holds every branch in its stack. git_pruner marks
+such a branch with `~`, says `rebase in progress` or `bisect in progress` on its row, and locks
+it. Finish or abort the operation (`git rebase --abort`, `git bisect reset`) to free it.
+
 ## Selecting merged, old branches
 
 Press `m`, type an age in days (it starts at 90, or at `pruner.staleDays`), and press `enter`.
@@ -209,6 +220,11 @@ confirmation screen counts the commits of any branch that is not.
 Deleting one is a push, so only `R` does it; `y` never touches a remote. The exit summary
 prints the `git push` command that puts a deleted remote branch back.
 
+Each row is mapped back to its branch on the remote through the remote's fetch refspecs
+(`remote.<name>.fetch`), so a refspec that renames branches deletes the right one. A row that
+maps to something other than one remote branch is not listed: pull request refs fetched with
+`+refs/pull/*/head:refs/remotes/origin/pr/*` are not branches a push can delete.
+
 ## Protected branches
 
 The default branch is always protected. Add your own with name globs:
@@ -219,7 +235,9 @@ git config --add pruner.protect develop
 ```
 
 A protected branch shows `P` and cannot be selected by any key. Remote rows are matched by the
-branch part of their name, so `release/*` covers `origin/release/1.0` too.
+branch part of their name, so `release/*` covers `origin/release/1.0` too. The same check
+applies to the remote branch a local branch tracks: `r` cannot arm the delete of
+`origin/release/1.0` from a local `hotfix` made from it.
 
 ## Script mode
 
@@ -241,6 +259,11 @@ default branch. It prints restore commands for what it deleted, and exits 1 if a
 stop after 60 seconds. A remote that asks for a password or does not answer fails with a message,
 instead of freezing the screen. Use a credential helper or an ssh agent for remotes that need a
 login.
+
+In a partial clone (`git clone --filter=blob:none`), git fetches file contents when it needs
+them, so `git cherry` (the commit count) and `git diff` (`v`) can also reach the remote. They get
+the same limits there. A commit count that fails is shown as unknown, never as zero, so `x` and
+`p` leave that branch unselected.
 
 ## Settings
 
