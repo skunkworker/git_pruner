@@ -119,6 +119,11 @@ for removals, magenta hunk headers. The diff is computed against the repository'
 (`git diff <base>...<branch>`), so it shows only the changes introduced on that branch since it
 diverged. The view is scrollable for large diffs; the header shows which base it was compared to.
 
+A large diff can take a few seconds to lay out through delta (about 2s for 120,000 lines). While
+it loads, the view shows a spinner, the step, the line count and the time so far, for example
+`⠹ delta is styling 121,800 lines… 1.4s`. The keys keep working: `q` goes back at once and stops
+delta, so a diff you no longer want does not keep a CPU core busy.
+
 ## Resolving the default branch
 
 The default branch is used as the diff base, as the merge target for the `✓` indicator, and to

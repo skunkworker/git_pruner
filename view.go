@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -180,7 +181,8 @@ func (m model) diffView() string {
 	if len(m.diffLines) == 0 {
 		msg := "no changes — branch matches " + base
 		if m.diffLoading {
-			msg = "loading diff…"
+			spin := spinnerFrames[m.spinnerFrame%len(spinnerFrames)]
+			msg = fmt.Sprintf("%s %s %.1fs", spin, m.diffNote, time.Since(m.diffStart).Seconds())
 		}
 		b.WriteString(dimStyle.Render(msg))
 		b.WriteString("\n\n")
@@ -814,3 +816,12 @@ func (m model) resultParts() (header, body, footer []string) {
 }
 
 func (m model) resultView() string { return m.page(m.resultParts()) }
+
+// groupDigits writes n with commas between groups of three digits (121,800).
+func groupDigits(n int) string {
+	s := strconv.Itoa(n)
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return s
+}
