@@ -51,7 +51,7 @@ git_pruner version     # also --version, -v
 | `tab`          | Switch between local branches and [remote-only branches](#remote-only-branches) |
 | `c`            | Checkout the branch under the cursor (`git switch`); on a remote-only row, create a local branch that tracks it |
 | `/`            | Filter branches by name; `enter` keeps it, `esc` clears it    |
-| `r`            | Toggle "also delete remote" for the row (needs an upstream on a remote that is not [protected](#protected-branches)) |
+| `r`            | Toggle "also delete remote" for the row (needs an upstream branch on a remote that is not [protected](#protected-branches)) |
 | `v`            | View the branch's diff (through [delta](https://github.com/dandavison/delta) when installed) |
 | `x`            | Select gone branches that hold no unique work (no fetch)      |
 | `p`            | Fetch `--all --prune`, then select gone branches that hold no unique work |
@@ -170,8 +170,9 @@ claiming the work is unrecoverable.
 - Remote: when armed with `r`, runs `git push <remote> --delete <branch>` on the branch's
   upstream, as git records it. That upstream need not share the branch's name: a branch made
   with `git switch -c feat origin/main` tracks `main`. So `r` refuses when the upstream is the
-  default branch or protected, and when the upstream is a local branch (`--track main`), which
-  has no remote branch to delete. Because this affects shared history, remote deletion
+  default branch or protected, when the upstream is a local branch (`--track main`), and when
+  it is not a branch at all (a pull request head such as `refs/pull/1/head`). None of these
+  has a remote branch to delete. Because this affects shared history, remote deletion
   requires the explicit `R` key on the confirmation screen — plain `y` deletes locals only.
   The confirmation screen also shows, per branch, whether the upstream is merged into the remote
   default (`✓ merged` / `⚠ not merged`) to help you judge whether the remote is safe to delete.
@@ -221,13 +222,16 @@ Deleting one is a push, so only `R` does it; `y` never touches a remote. The exi
 prints the `git push` command that puts a deleted remote branch back.
 
 Each row is mapped back to its branch on the remote through the remote's fetch refspecs
-(`remote.<name>.fetch`), so a refspec that renames branches deletes the right one. A row that
+(`remote.<name>.fetch`), so a refspec that renames branches deletes the right one. The
+confirmation screen names that branch when it differs from the row. A row that
 maps to something other than one remote branch is not listed: pull request refs fetched with
 `+refs/pull/*/head:refs/remotes/origin/pr/*` are not branches a push can delete.
 
 ## Protected branches
 
-The default branch is always protected. Add your own with name globs:
+The default branch is always protected, and so is the default branch of each remote whose
+`<remote>/HEAD` is set (`git remote set-head <remote> --auto` sets it). Add your own with name
+globs:
 
 ```sh
 git config --add pruner.protect 'release/*'
@@ -235,8 +239,9 @@ git config --add pruner.protect develop
 ```
 
 A protected branch shows `P` and cannot be selected by any key. Remote rows are matched by the
-branch part of their name, so `release/*` covers `origin/release/1.0` too. The same check
-applies to the remote branch a local branch tracks: `r` cannot arm the delete of
+branch part of their name, so `release/*` covers `origin/release/1.0` too. When a fetch
+refspec renames branches, the glob is also matched against the name on the remote. The same
+check applies to the remote branch a local branch tracks: `r` cannot arm the delete of
 `origin/release/1.0` from a local `hotfix` made from it.
 
 ## Script mode
@@ -263,7 +268,10 @@ login.
 In a partial clone (`git clone --filter=blob:none`), git fetches file contents when it needs
 them, so `git cherry` (the commit count) and `git diff` (`v`) can also reach the remote. They get
 the same limits there. A commit count that fails is shown as unknown, never as zero, so `x` and
-`p` leave that branch unselected.
+`p` leave that branch unselected. Commit counts run in the background, so the screen keeps
+drawing while they wait; `d` opens the confirmation screen when they finish. `git switch` (`c`)
+can fetch too. It runs without a terminal, but with no time limit, because stopping a checkout
+partway leaves the repository locked.
 
 ## Settings
 

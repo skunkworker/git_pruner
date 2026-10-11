@@ -100,8 +100,8 @@ func TestUndoRestoresDeletedBranches(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("u must start the restore")
 	}
-	nm, _ = m.Update(cmd())
-	m = nm.(model)
+	nm, next := m.Update(cmd())
+	m = settle(m, nm.(model), next)
 	if got := git(t, repo, "rev-parse", "refs/heads/feature/tracked"); got != sha {
 		t.Fatalf("restored at %s, want %s", got, sha)
 	}
@@ -403,8 +403,8 @@ func TestRemoteOnlyView(t *testing.T) {
 	if cmd == nil || !m.showRemote {
 		t.Fatal("tab must switch view and load the remote rows")
 	}
-	nm, _ = m.Update(cmd())
-	m = nm.(model)
+	nm, next := m.Update(cmd())
+	m = settle(m, nm.(model), next)
 	var names []string
 	for _, i := range m.viewIdx() {
 		names = append(names, m.branches[i].name)
@@ -446,9 +446,7 @@ func TestCheckoutRemoteOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nm, cmd := m.Update(special(tea.KeyTab))
-	nm, _ = nm.(model).Update(cmd())
-	m = nm.(model)
+	m = openRemoteView(t, m)
 	cursorTo(t, &m, "origin/orphan")
 	m = doSwitch(t, m)
 	if m.err != "" || currentBranch(t, repo) != "orphan" {
@@ -459,6 +457,28 @@ func TestCheckoutRemoteOnly(t *testing.T) {
 	}
 	if b := m.cur(); b == nil || b.name != "orphan" || b.upstream != "origin/orphan" {
 		t.Fatalf("cursor must be on the new tracking branch: %+v", b)
+	}
+}
+
+// A remote's name can hold a slash. The local copy of team/a/x is x, as git's
+// own checkout names it, not a/x.
+func TestCheckoutRemoteWithSlashInName(t *testing.T) {
+	repo := initRepo(t, "main")
+	commitFile(t, repo, "a", "a")
+	remote := t.TempDir()
+	git(t, remote, "init", "--bare", "-q", "-b", "main")
+	git(t, repo, "remote", "add", "team/a", remote)
+	git(t, repo, "push", "-q", "team/a", "main:x")
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m = openRemoteView(t, m)
+	cursorTo(t, &m, "team/a/x")
+	m = doSwitch(t, m)
+	if m.err != "" || currentBranch(t, repo) != "x" {
+		t.Fatalf("c must make x, got %q (err %q)", currentBranch(t, repo), m.err)
 	}
 }
 
