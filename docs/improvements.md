@@ -130,7 +130,7 @@ outlive it is still sitting on the remote.
 
 Local and network work are now capped separately — `maxLocalGit = 8`, `maxRemotePush = 3` — so a
 wide local fan-out never widens the network one. The cap sits inside `runGit`, the single door
-every git invocation already passes through, and `networkBound(args)` picks which one applies. Put
+every git invocation already passes through, and `networkBound(args)` (now `networkUse`) picks which one applies. Put
 at the call sites instead it held only for the callers that remembered to ask: `fetchPruneCmd` and
 `forceDeleteUnmerged` both escaped it.
 

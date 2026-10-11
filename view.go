@@ -594,6 +594,10 @@ func (m model) confirmParts() (header, body, footer []string) {
 		switch {
 		case br.remoteOnly:
 			body = append(body, "      "+dimStyle.Render("remote branch — no local copy"))
+			// A renaming fetch refspec gives the remote's branch another name.
+			if target := br.remoteName() + "/" + br.remoteBranch(); target != br.name {
+				body = append(body, "      "+errStyle.Render("delete remote "+target))
+			}
 		case br.gone:
 			body = append(body, "      "+goneStyle.Render("upstream gone: "+br.upstream+" — will prune with -D (force)"))
 		case br.upstream != "":
@@ -607,7 +611,7 @@ func (m model) confirmParts() (header, body, footer []string) {
 			// A gone branch has no upstream left to test, so remoteMerged is
 			// always false for it. The risk count is the real answer: say so
 			// when it is clean, and riskWarning speaks when it is not.
-			if br.riskMeasured && br.riskCommits == 0 && m.riskBase != "" {
+			if br.riskMeasured && !br.atRisk() && m.riskBase != "" {
 				body = append(body, "      "+okStyle.Render("✓ no commits missing from "+m.riskBase))
 			}
 		case br.upstream != "" && m.remoteDefault != "":
@@ -665,7 +669,7 @@ func (m model) worktreeWarning(br branch) string {
 // discarded, under -d the delete simply fails.
 func (m model) riskWarning(br branch) string {
 	if br.remoteOnly {
-		if br.riskCommits != 0 {
+		if br.atRisk() {
 			return fmt.Sprintf("⚠ %s — this may be the only shared copy of them", m.riskCount(br))
 		}
 		return ""
@@ -674,7 +678,7 @@ func (m model) riskWarning(br branch) string {
 		return ""
 	}
 	if br.forcedDelete(m.force) { // -D: the question is what gets discarded
-		if br.riskCommits != 0 {
+		if br.atRisk() {
 			return fmt.Sprintf("⚠ %s — force delete (-D) will discard them", m.riskCount(br))
 		}
 		if m.riskBase == "" {
@@ -683,17 +687,17 @@ func (m model) riskWarning(br branch) string {
 		return "" // measured against a real base: nothing here is at risk
 	}
 	// -d will be refused either way; the count is what a force would then cost.
-	if br.riskCommits != 0 {
+	if br.atRisk() {
 		return fmt.Sprintf("⚠ not fully merged: %s — safe delete (-d) will fail; use force (f)", m.riskCount(br))
 	}
 	return "⚠ not fully merged — safe delete (-d) will fail; use force (f)"
 }
 
 // riskCount phrases br's risk count for a warning. A count git cherry could not
-// take (riskUnknown) is nonzero on purpose, so every warning that tests for
-// commits at risk also speaks for it.
+// take is at risk (see atRisk), so every warning that tests for commits at risk
+// also speaks for it.
 func (m model) riskCount(br branch) string {
-	if br.riskCommits == riskUnknown {
+	if br.riskFailed {
 		return "an unknown number of commits not in " + m.riskBase
 	}
 	return fmt.Sprintf("%d commit(s) not in %s", br.riskCommits, m.riskBase)
@@ -715,10 +719,10 @@ func (m model) forcePromptParts() (header, body, footer []string) {
 	for _, r := range failures {
 		body = append(body, "  "+cursorStyle.Render("• "+r.br.name)+dimStyle.Render("  at "+r.br.hash))
 		// Every branch here failed -d, so its risk was measured before the delete
-		// ran: riskCommits == 0 means either nothing is missing from the base or
-		// there was no base to measure against.
+		// ran: a branch not at risk has either nothing missing from the base or
+		// no base to measure against.
 		switch {
-		case r.br.riskCommits != 0:
+		case r.br.atRisk():
 			body = append(body, "      "+errStyle.Render(fmt.Sprintf("⚠ %s will be lost", m.riskCount(r.br))))
 		case m.riskBase == "":
 			body = append(body, "      "+errStyle.Render("⚠ no base branch to compare against — unmerged commits may be lost"))

@@ -204,15 +204,16 @@ and on every branch a `rebase --update-refs` will move. The worktree's HEAD is d
   `origin`'s `main`, a remote the branch never used.
 
 Fixed by `remoteProtected` (trunk and protect checks on `remoteBranch()`) and
-`remoteDeletable()`, which also refuses a local upstream. *(`TestRemoteDeleteRefusesWrongTargets`)*
+`remoteDeletable()` (now `remoteDelete()`, see 31), which also refuses a local upstream.
+*(`TestRemoteDeleteRefusesWrongTargets`)*
 
 ### 17. Remote rows ignored fetch refspecs *(confirmed — fixed)*
 
 With `+refs/heads/jb/*:refs/remotes/origin/*`, the row `origin/old` is `jb/old` on the remote,
 but the delete pushed `refs/heads/old` and removed a teammate's branch. `mapRemoteRows` now maps
 each row back through `remote.<name>.fetch`. Rows that map to no branch, or to more than one
-source (the usual pull request refspec next to the default one), are dropped. Every remote's
-trunk is now protected in the remote view, not only the default remote's.
+source (the usual pull request refspec next to the default one), are dropped. This fix claimed
+that every remote's trunk was protected in the remote view. It was not until item 21.
 *(`TestRemoteRowsFollowFetchRefspecs`)*
 
 ### 18. Partial clones reach the network from `cherry` and `diff` *(confirmed — fixed)*
@@ -235,6 +236,137 @@ kill a checkout partway and leave `index.lock` behind.
   it. The safe side.
 - `git am` in progress: HEAD stays on the branch, so it already shows as current.
 - Locked worktree: the remove is refused as designed.
+
+## Tier 5 — review of the Tier 4 fixes — **DONE 2026-10-10** (one new item, 34, open)
+
+A `/code-review` of the Tier 4 work found these on 2026-10-09, before its commit. The review
+reproduced 19, 21 and 22 in throwaway repos. A read of the code confirmed 19 and 20. Reproduce
+each other one before the fix. Every fix gets a test that fails with the fix taken out, then
+`go test -race`, `gofmt` and `go vet`, and README and `bugs.md` updates.
+
+### Order
+
+1. **Done.** Commit the Tier 4 work first, so the review fixes have their own diff: `c4846f2`,
+   merged in PR #7.
+2. **Done.** 31, then 19 inside it: one function, one place for the `r` rules.
+3. **Done.** 20, 21, 26, 25: what `r` and the confirm screen protect and show.
+4. **Done.** 22, 23, 24: all in `loadHeldBranches`.
+5. **Done.** 28, 27: small, separate.
+6. **Done.** 29 and 30 together: both split `networkBound`.
+7. **Done.** 32 and 33 last: larger, and not wrong today. 33 went first, so 32 carries a
+   plain count.
+
+### Correctness
+
+**19. `r` can delete a branch that is not the upstream** — `git.go` `remoteDelete` — **DONE**.
+With the pull request refspec listed first, `git switch --track origin/pr/1` gives
+`merge = refs/pull/1/head`. `remoteBranch()` then falls back to the tracking name, and the push
+deletes `refs/heads/pr/1`, a teammate's branch. Fixed: `r` arms only when `upMerge` starts with
+`refs/heads/`, and the refusal names the ref. Reproduced first with git 2.55. Covered by the
+`pr/1` case in `TestRemoteDeleteRefusesWrongTargets`: `r` refuses, and the bare remote still has
+`refs/heads/pr/1`.
+
+**20. A renaming refspec drops protection** *(regression from 17)* — `model.go` `isProtected` —
+**DONE**. `mapRemoteRows` sets `upMerge`, so `remoteBranch()` of the row `origin/release/1.0`
+was `jb/release/1.0`, and `release/*` no longer matched. The README says protect globs match
+the name shown. Fixed: `protectsRemote` matches the globs against both the shown name and the
+remote's name, for remote rows and for `remoteProtected`. Covered in
+`TestRemoteRowsFollowFetchRefspecs`: the row `origin/release/1.0` is protected, and `r` refuses
+on a local `hotfix` made from `origin/release/2.0`.
+
+**21. Only the default remote's trunk is protected** — `model.go` `protectsName` — **DONE**.
+`upstream/master` next to `origin/main` was not protected. `TestRemoteRowsFollowFetchRefspecs`
+passed only because `fork`'s trunk was the default remote. Fixed: `resolveBases` keeps the
+target of each `refs/remotes/<r>/HEAD` in `m.remoteTrunks`, and `protectsRemote` protects those
+refs in both checks. A remote with no `<r>/HEAD` (added with `remote add`, never `set-head`) has
+no known trunk. The test now gives `fork` the trunk `master` with `fork/HEAD` set, and gives
+`origin` a `main` so `fork` is not the default remote. Item 17's text is corrected.
+
+**22. A repo path with `[`, `*` or `?` hides linked worktrees** — `git.go` `loadHeldBranches` —
+**DONE**. `filepath.Glob` read the path as a pattern. Fixed: `os.ReadDir(<common>/worktrees)`.
+Covered: `TestHeldBranchesAreLocked` now runs in a folder named `a[1]`.
+
+**23. Left-over bisect state locks a branch git would delete** — `git.go` `readHeld` — **DONE**.
+git's `wt_status_check_bisect` reads `BISECT_START` only when `BISECT_LOG` exists. Reproduced
+with git 2.55: without `BISECT_LOG`, `git branch -D` succeeds. Fixed: the same check.
+*(`TestLeftoverBisectStartDoesNotLock`)*
+
+**24. git older than 2.31 turns off held-branch checks with no error** — `loadHeldBranches` —
+**DONE**. Old `rev-parse` prints an unknown `--path-format=absolute` back as output, so `common`
+was wrong and every read missed. Checked with git 2.55: `rev-parse` echoes unknown flags, and
+prints `--git-common-dir` relative to the current folder (`../../.git` from a subfolder),
+or absolute from a linked worktree. Fixed: the flag is gone. `filepath.Abs` is not needed: the
+reads resolve the relative path from the same folder. No test can fail without this fix on a
+current git. `TestHeldBranchesAreLocked` now also reads the held branches from a subfolder and
+from a linked worktree, which guards the relative path.
+
+**25. A stale refusal stays on screen** — `model.go`, the `r` case — **DONE**.
+Fixed: `r` clears `m.status` when it toggles. Covered in `TestRemoteDeleteRefusesWrongTargets`:
+`r` on a refused row, then on a good row, leaves the status empty.
+
+**26. The confirm screen hides a renamed remote target** — `view.go` `confirmParts` — **DONE**.
+For the row `origin/old` mapped to `jb/old`, the confirm screen said only "remote branch — no
+local copy", but the result line said `origin/jb/old`. Fixed: it adds
+`delete remote <remote>/<remoteBranch()>` when that differs from the row name. Covered in
+`TestRemoteRowsFollowFetchRefspecs`: the confirm view contains `origin/jb/old`.
+
+**27. A test check that cannot fail** — `main_test.go`, end of `TestHeldBranchesAreLocked` —
+**DONE**. `selectedBranches()` already drops locked rows. Fixed: after `a`, the test checks
+`.selected` on each held branch. Mutation check passed: with the locked guard in `a` removed,
+the test fails.
+
+**28. A remote name with `/` gives the wrong local name on `c`** — `model.go` `switchCmd` —
+**DONE**. Remote `team/a`, row `team/a/x`: the local branch became `a/x`. Fixed:
+`strings.TrimPrefix(b.name, b.upRemote+"/")`. *(`TestCheckoutRemoteWithSlashInName`)*
+
+### Design
+
+**29. `git switch` in a partial clone can show an ssh prompt** — `git.go` `networkBound` —
+**DONE**. It stays without a timeout on purpose (see 18), so it got no `detachTTY` either.
+Fixed: `networkBound` is now `networkUse`, which returns a `gitNet` with three flags:
+`connects` (remote slot), `timeout` and `noTTY`. `switch` in a partial clone gets `noTTY` only.
+
+**30. Partial clones run risk counts 3 at a time, not 8** — `networkBound` — **DONE**.
+`cherry` and `diff` took the remote slots even when the files were local. Fixed with 29: they
+get `timeout` and `noTTY`, and keep the local slots. Both covered in
+`TestPartialCloneRiskIsNotGuessed`. Mutation checks passed: `cherry` with `connects`, or
+`switch` without `noTTY`, fails it.
+
+**31. `remoteDeletable` and `remoteRefusal` repeat the same checks** — `git.go` — **DONE**.
+Fixed: one `remoteDelete() (ok bool, why string)`, done before 19, so 19 added its check once.
+
+**32. Risk counts can freeze the screen** — `model.go` `countRisk` callers — **DONE**.
+They ran inside `Update`: in `d`, and in every reload (a fetch for `p`, the end of a delete
+run, a switch, an undo, the remote view's load). `x` itself counted nothing. With the 60 s
+network timeout from 18, a slow partial clone could block the screen for minutes. Fixed:
+- Every reload installs the list and returns `mergeCmd`, the same `tea.Cmd` startup already
+  used. `installBranches` sets `m.merging`, so `x` and `d` wait until it lands.
+- `p` sets `selectOnMerge`, and `selectAfterFetch` selects the gone branches once the counts
+  land.
+- `d` calls `confirmAfterRisk`, which counts in a `tea.Cmd` and sets `m.measuring`. The
+  `riskMsg` opens the confirm screen. A count for an older load is dropped, with a status
+  line that says to press `d` again.
+- Script mode and `startDeletions` keep the waiting `measureSelectedRisk`. In the TUI it
+  counts nothing, because `d` measured the selection first.
+
+Tests drive the new cmds with a `settle` helper in `press`, `drainDeletions`, `doSwitch` and
+`openRemoteView`. *(`TestRiskCountsRunOffTheUpdateLoop`: no git process runs inside `Update`
+for a reload or for `d`.)* Mutation checks passed: either path made synchronous again fails it.
+
+**33. `riskUnknown = -1` lives in a count field** — `git.go` — **DONE**.
+Any new `> 0` or `== 0` test misread it. Fixed: `riskFailed` sits next to `riskMeasured`, and
+`riskCommits` is a plain count. `riskCount{commits, failed}` carries both. Every "commits at
+risk" check asks `atRisk()`, which is true for a failed count. Covered in
+`TestPartialCloneRiskIsNotGuessed`. Mutation check passed: a plain `riskCommits == 0` on the
+confirm screen shows a failed count as clean, and fails the test.
+
+### Found while fixing
+
+**34. A forced retry runs deletes and pushes inside `Update`** — `model.go`
+`forceDeleteUnmerged` — **TODO**. `y` on the force prompt runs `git branch -D` and
+`pushRemoteDelete` for each refused branch inside `Update`. A push can wait out the 60 s
+timeout, so a slow remote freezes the screen, as in 32. Fix: run the retry as a `tea.Cmd`, like
+`startDeletions`, and apply the results from a message.
 
 ## Ref handling — the rule this work established
 
@@ -259,17 +391,29 @@ open in `localDefaultBranch`. It has been deleted.
 
 ## Status
 
-All three tiers are complete (2026-08-17): **14 tests added, 43 total**, passing under
-`-race`, with `gofmt` and `go vet` clean.
+Tiers 1 to 5 are done. One new item, 34, is open.
 
-- Tier 1 fixed two real bugs — tag shadowing on the risk path, and `p` wiping selections.
+The suite has **99 tests** (81 in `main_test.go`, 18 in `features_test.go`), passing under
+`-race`, with `gofmt` and `go vet` clean (2026-10-10). Tiers 1 to 3 ended at 43; Tier 4 added 4;
+Tier 5 added 3.
+
+- Tier 1 (2026-08-17) fixed two real bugs — tag shadowing on the risk path, and `p` wiping selections.
 - Tier 2 found no new bugs; it pins five repo environments that had no coverage, and
   corrected two wrong predictions in this document against real git behavior.
 - Tier 3 pins five everyday operations and corrected one more prediction.
 - A `/simplify` pass then found **two further live instances of the tag-shadowing bug** that
   Tier 1 had missed (`localDefaultBranch` and `push --delete`), removed the `qualifyRef`
-  probe, and brought startup back from 11 git subprocesses to 7 — the pre-change baseline. It is
-6 now, in two concurrent rounds rather than six serial ones (see item 18 in `improvements.md`).
+  probe, and brought startup back from 11 git subprocesses to 7 — the pre-change baseline.
+  Item 18 in `improvements.md` then took it to 6, in two concurrent rounds rather than six
+  serial ones.
+- Tier 4 (2026-10-09) fixed four bugs where git state outside the branch list changed what a
+  delete does. It is in `c4846f2`, merged in PR #7.
+
+Startup is now 9 git subprocesses in `setupRepo`'s shape, still in two rounds. Later work added
+three reads to the first round: the config, the worktree list and the held branches. The first
+round is the repo check plus the six reads in `loadRepo`. The second is the two merge queries
+against the base. Gone branches add their risk counts on top. `TestMergedBranchesCostNoSubprocess`
+caps a load at 12.
 
 Fixtures compose rather than duplicate: `initRepo` (bare init + identity) →
 `setupLocalRepo` (branch shapes) → `setupRepo` (+ `addOrigin` + a tracking branch), with

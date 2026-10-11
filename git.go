@@ -35,8 +35,9 @@ type branch struct {
 	gone         bool // upstream was configured but no longer exists
 	remoteMerged bool // upstream is merged into the remote default branch (safe to delete)
 	headMerged   bool // branch tip is merged into HEAD (git's -d criterion when there is no upstream)
-	riskCommits  int  // commits whose patch is not in the base branch; -D discards them (riskUnknown: not countable)
+	riskCommits  int  // commits whose patch is not in the base branch; -D discards them
 	riskMeasured bool // riskCommits has been computed (0 is a meaningful value)
+	riskFailed   bool // git cherry failed, so the count is unknown and riskCommits says nothing
 	isCurrent    bool
 	worktree     string // path of another worktree that has the branch checked out; "" when none does
 	mainWorktree bool   // that worktree is the main one, which git cannot remove
@@ -54,30 +55,40 @@ type branch struct {
 // a remoteOnly row arms it: deleting the remote branch is all it offers.
 func (b branch) remoteArmed() bool { return (b.deleteRemote || b.remoteOnly) && b.upstream != "" }
 
+// setRisk records b's measured cost of deletion.
+func (b *branch) setRisk(r riskCount) {
+	b.riskCommits, b.riskFailed, b.riskMeasured = r.commits, r.failed, true
+}
+
+// atRisk reports whether -D can discard commits of b: some are not in the base,
+// or git cherry could not tell. Every check for commits at risk asks this, so an
+// unknown count is never read as clean.
+func (b branch) atRisk() bool { return b.riskFailed || b.riskCommits > 0 }
+
 // locked reports whether b can never be marked for deletion. A branch in a
 // linked worktree is not: the delete removes the worktree first. The main
 // worktree cannot be removed, so its branch stays locked.
 func (b branch) locked() bool { return b.isCurrent || b.mainWorktree || b.heldBy != "" || b.protected }
 
-// remoteDeletable reports whether r may arm the delete of b's remote branch. An
+// remoteDelete reports whether r may arm the delete of b's remote branch. why
+// says what stops it, and is "" when the row already shows the reason. An
 // upstream that is a local branch (remote ".") has no remote branch at all, and
-// remoteName would guess a remote b never used.
-func (b branch) remoteDeletable() bool {
-	return b.upstream != "" && b.upRemote != "." && !b.remoteOnly && !b.locked() && !b.remoteProtected
-}
-
-// remoteRefusal says why r cannot arm b's remote delete, for the cases the row
-// does not already show.
-func (b branch) remoteRefusal() string {
+// remoteName would guess a remote b never used. An upstream outside refs/heads/,
+// such as a pull request head, is not a branch either, and remoteBranch would
+// fall back to the tracking name: origin/pr/1 would push the delete of a
+// teammate's pr/1.
+func (b branch) remoteDelete() (ok bool, why string) {
 	switch {
 	case b.remoteOnly || b.locked() || b.upstream == "":
-		return ""
+		return false, ""
 	case b.upRemote == ".":
-		return b.name + " tracks local branch " + b.upstream + ": there is no remote branch to delete"
+		return false, b.name + " tracks local branch " + b.upstream + ": there is no remote branch to delete"
+	case !strings.HasPrefix(b.upMerge, "refs/heads/"):
+		return false, b.name + " tracks " + b.upMerge + " on " + b.remoteName() + ", which is not a branch: there is no remote branch to delete"
 	case b.remoteProtected:
-		return "remote branch " + b.remoteName() + "/" + b.remoteBranch() + " is protected"
+		return false, "remote branch " + b.remoteName() + "/" + b.remoteBranch() + " is protected"
 	}
-	return ""
+	return true, ""
 }
 
 // ref is b's fully qualified ref (see branchRef).
@@ -99,6 +110,11 @@ func (b branch) remoteName() string {
 	}
 	return "origin"
 }
+
+// shownBranch is the branch part of b's tracking name: origin/release/1.0 gives
+// release/1.0. A renaming fetch refspec can make it differ from remoteBranch.
+// The remote's name can hold a slash, so it is trimmed whole.
+func (b branch) shownBranch() string { return strings.TrimPrefix(b.upstream, b.remoteName()+"/") }
 
 func (b branch) remoteBranch() string {
 	if s, ok := strings.CutPrefix(b.upMerge, "refs/heads/"); ok {
@@ -152,22 +168,36 @@ var (
 	remoteSlots = make(chan struct{}, maxRemotePush)
 )
 
-// networkBound reports whether a git invocation opens a connection to a remote.
-// It is what picks the cap, so a new network subcommand belongs here rather than
-// at its call site.
-func networkBound(args []string) bool {
+// gitNet says how one git invocation may use the network.
+type gitNet struct {
+	connects bool // opens a connection on every call: takes a remote slot
+	timeout  bool // can wait on a remote: bounded by netTimeout
+	noTTY    bool // can reach a remote, where ssh may ask for a passphrase: run with no terminal
+}
+
+// networkUse reports how a git invocation may use the network. It is what picks
+// the cap, the timeout and the terminal, so a new network subcommand belongs
+// here rather than at its call site.
+func networkUse(args []string) gitNet {
 	if len(args) == 0 {
-		return false
+		return gitNet{}
 	}
+	lazy := lazyFetch.Load()
 	switch args[0] {
 	case "push", "fetch":
-		return true
+		return gitNet{connects: true, timeout: true, noTTY: true}
 	case "cherry", "diff":
 		// Both read file contents, which a partial clone fetches on demand.
-		// Killing either on the timeout is safe: they change nothing.
-		return lazyFetch.Load()
+		// Killing either on the timeout is safe: they change nothing. They keep
+		// the local cap: it already bounds them, and the remote cap would run
+		// a risk count 3 at a time.
+		return gitNet{timeout: lazy, noTTY: lazy}
+	case "switch":
+		// A checkout in a partial clone fetches too, but gets no timeout:
+		// killing it partway leaves index.lock behind.
+		return gitNet{noTTY: lazy}
 	}
-	return false
+	return gitNet{}
 }
 
 // lazyFetch records that the repository is a partial clone (git clone
@@ -204,9 +234,9 @@ var gitProcs, netProcs gauge
 // makes it the place to bound them: a cap at the call sites would only hold for
 // the callers that remembered to ask.
 func runGit(args ...string) (string, error) {
-	net := networkBound(args)
+	use := networkUse(args)
 	slots := localSlots
-	if net {
+	if use.connects {
 		slots = remoteSlots
 	}
 	slots <- struct{}{}
@@ -216,13 +246,13 @@ func runGit(args ...string) (string, error) {
 	// rather than what is queued.
 	gitProcs.enter()
 	defer gitProcs.leave()
-	if net {
+	if use.connects {
 		netProcs.enter()
 		defer netProcs.leave()
 	}
 
 	ctx := context.Background()
-	if net {
+	if use.timeout {
 		// A remote that stops answering would otherwise hold the slot, and the
 		// screen waiting on it, forever.
 		var cancel context.CancelFunc
@@ -236,7 +266,7 @@ func runGit(args ...string) (string, error) {
 	// GIT_TERMINAL_PROMPT=0 makes git fail instead of asking for a password: the
 	// TUI owns the terminal, so a prompt there can never be answered.
 	cmd.Env = append(os.Environ(), "LC_ALL=C", "GIT_TERMINAL_PROMPT=0")
-	if net {
+	if use.noTTY {
 		// ssh asks for passphrases on /dev/tty, past GIT_TERMINAL_PROMPT. With no
 		// controlling terminal it fails fast instead of fighting the TUI for input.
 		detachTTY(cmd)
@@ -495,22 +525,26 @@ func baseBranch(name string) string {
 // squashed as a group still count, since no equivalent single patch exists;
 // the warning is therefore worded as "not in <base>", not "will be lost".
 // Returns 0 when there is nothing to compare against.
-func riskCommitCount(name, base string) int { return riskCommitCountRef(branchRef(name), base) }
+func riskCommitCount(name, base string) riskCount { return riskCommitCountRef(branchRef(name), base) }
 
-// riskUnknown is the count of a branch git cherry could not measure. A partial
-// clone that cannot reach its remote fails there, and reading the failure as 0
-// would let x and p select a branch whose commits -D then discards.
-const riskUnknown = -1
+// riskCount is one branch's measured cost of deletion.
+type riskCount struct {
+	commits int
+	// failed records that git cherry failed. A partial clone that cannot reach
+	// its remote fails there, and reading the failure as 0 would let x and p
+	// select a branch whose commits -D then discards.
+	failed bool
+}
 
 // riskCommitCountRef is riskCommitCount for any fully qualified ref, which is
 // what lets a remote branch be measured the same way.
-func riskCommitCountRef(ref, base string) int {
+func riskCommitCountRef(ref, base string) riskCount {
 	if base == "" || base == ref {
-		return 0
+		return riskCount{}
 	}
 	out, err := runGit("cherry", base, ref)
 	if err != nil {
-		return riskUnknown
+		return riskCount{failed: true}
 	}
 	n := 0
 	for _, line := range strings.Split(out, "\n") {
@@ -518,7 +552,7 @@ func riskCommitCountRef(ref, base string) int {
 			n++
 		}
 	}
-	return n
+	return riskCount{commits: n}
 }
 
 // mergedSet runs a `git branch --merged` query and collects the short ref names
@@ -719,14 +753,22 @@ func mainWorktreePath() string {
 // worktree keeps this state in its own git dir: the common dir for the main
 // worktree, and worktrees/<id> under it for each linked one.
 func loadHeldBranches() map[string]string {
-	out, err := runGit("rev-parse", "--path-format=absolute", "--git-common-dir")
+	// The path may be relative to the current folder, which the reads below
+	// resolve it from too. --path-format=absolute would need git 2.31; older git
+	// prints the unknown flag back as output.
+	out, err := runGit("rev-parse", "--git-common-dir")
 	if err != nil {
 		return nil
 	}
 	common := strings.TrimSpace(out)
-	linked, _ := filepath.Glob(filepath.Join(common, "worktrees", "*"))
+	dirs := []string{common}
+	// Listed, not globbed: a repo path can hold [, * or ?.
+	linked, _ := os.ReadDir(filepath.Join(common, "worktrees"))
+	for _, e := range linked {
+		dirs = append(dirs, filepath.Join(common, "worktrees", e.Name()))
+	}
 	held := map[string]string{}
-	for _, dir := range append([]string{common}, linked...) {
+	for _, dir := range dirs {
 		readHeld(dir, held)
 	}
 	return held
@@ -754,7 +796,12 @@ func readHeld(dir string, held map[string]string) {
 		}
 	}
 	// BISECT_START names the branch bisect started from, or holds a commit ID
-	// when it started from a detached HEAD.
+	// when it started from a detached HEAD. Like git (wt_status_check_bisect),
+	// trust it only while BISECT_LOG exists: a bisect cleaned up by hand can
+	// leave it behind.
+	if _, err := os.Stat(filepath.Join(dir, "BISECT_LOG")); err != nil {
+		return
+	}
 	if start := read("BISECT_START"); start != "" && !isObjectID(start) {
 		held[branchRef(start)] = "bisect"
 	}

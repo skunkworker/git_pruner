@@ -64,8 +64,8 @@ func deleteMsgs(t *testing.T, cmd tea.Cmd) []branchDeletedMsg {
 func drainDeletions(t *testing.T, m model, cmd tea.Cmd) model {
 	t.Helper()
 	for _, dm := range deleteMsgs(t, cmd) {
-		nm, _ := m.Update(dm)
-		m = nm.(model)
+		nm, next := m.Update(dm)
+		m = settle(m, nm.(model), next)
 	}
 	return m
 }
@@ -124,11 +124,16 @@ func git(t *testing.T, dir string, args ...string) string {
 // identity configured. Callers add the commits, remotes and branches they need.
 func initRepo(t *testing.T, branch string) string {
 	t.Helper()
-	tmp := t.TempDir()
-	git(t, tmp, "init", "-q", "-b", branch)
-	git(t, tmp, "config", "user.email", "t@t.t")
-	git(t, tmp, "config", "user.name", "t")
-	return tmp
+	return initRepoIn(t, t.TempDir(), branch)
+}
+
+// initRepoIn is initRepo in a folder of the caller's choice, which git makes.
+func initRepoIn(t *testing.T, dir, branch string) string {
+	t.Helper()
+	git(t, filepath.Dir(dir), "init", "-q", "-b", branch, dir)
+	git(t, dir, "config", "user.email", "t@t.t")
+	git(t, dir, "config", "user.name", "t")
+	return dir
 }
 
 // addOrigin gives dir a bare origin remote and pushes trunk to it.
@@ -1019,8 +1024,8 @@ func TestGoneBranchWithUnpushedCommitsIsGuarded(t *testing.T) {
 	for i := range m.branches {
 		m.branches[i].selected = false
 	}
-	nm, _ := m.Update(fetchDoneMsg{})
-	after := nm.(model)
+	nm, cmd := m.Update(fetchDoneMsg{})
+	after := settle(m, nm.(model), cmd)
 	if b := find(after.branches, "feature/tracked"); b == nil || b.selected {
 		t.Fatalf("gone branch holding unique commits must not be auto-selected: %+v", b)
 	}
@@ -1054,8 +1059,8 @@ func TestGoneMergedBranchStillAutoSelected(t *testing.T) {
 	if w := m.riskWarning(*b); w != "" {
 		t.Fatalf("a gone branch holding nothing unique must not warn: %q", w)
 	}
-	nm, _ := m.Update(fetchDoneMsg{})
-	after := nm.(model)
+	nm, cmd := m.Update(fetchDoneMsg{})
+	after := settle(m, nm.(model), cmd)
 	if b := find(after.branches, "feature/tracked"); b == nil || !b.selected {
 		t.Fatalf("risk-free gone branch should still be auto-selected: %+v", b)
 	}
@@ -1075,14 +1080,14 @@ func TestRiskCommitCountIgnoresCherryPicked(t *testing.T) {
 	git(t, repo, "checkout", "-q", "main")
 	git(t, repo, "cherry-pick", "picked")
 
-	if n := riskCommitCount("picked", "main"); n != 0 {
+	if n := riskCommitCount("picked", "main").commits; n != 0 {
 		t.Fatalf("cherry-picked commit should not count as at risk, got %d", n)
 	}
-	if n := riskCommitCount("feature/unmerged", "main"); n != 1 {
+	if n := riskCommitCount("feature/unmerged", "main").commits; n != 1 {
 		t.Fatalf("genuinely unmerged commit should count, got %d", n)
 	}
 	// No base to compare against means nothing can be asserted about risk.
-	if n := riskCommitCount("picked", ""); n != 0 {
+	if n := riskCommitCount("picked", "").commits; n != 0 {
 		t.Fatalf("empty base should yield 0, got %d", n)
 	}
 }
@@ -1248,8 +1253,7 @@ func TestUnmergedBranchWithoutUpstreamIsWarned(t *testing.T) {
 
 	// Drive the real path: 'd' measures the selection's risk, then confirms.
 	b.selected = true
-	nm, _ := m.updateList(key("d"))
-	m = nm.(model)
+	m = press(t, m, key("d"))
 	wantState(t, m, stateConfirm, "'d' should open the confirm screen")
 	b = find(m.branches, "feature/unmerged")
 	if b.riskCommits != 1 {
@@ -1429,7 +1433,7 @@ func TestTagShadowingBranchName(t *testing.T) {
 		// Tag the base commit with the name of a branch that is one commit ahead.
 		git(t, repo, "tag", "feature/unmerged", "main")
 
-		if n := riskCommitCount("feature/unmerged", "origin/main"); n != 1 {
+		if n := riskCommitCount("feature/unmerged", "origin/main").commits; n != 1 {
 			t.Fatalf("want the branch's 1 unique commit measured, got %d (the tag was measured)", n)
 		}
 		diff, _, err := loadDiff("feature/unmerged")
@@ -1454,8 +1458,7 @@ func TestTagShadowingBranchName(t *testing.T) {
 
 		// End to end: the confirm screen must still state what the delete costs.
 		b.selected = true
-		nm, _ := m.updateList(key("d"))
-		m = nm.(model)
+		m = press(t, m, key("d"))
 		out := stripANSI(m.confirmView())
 		if !strings.Contains(out, fmt.Sprintf("1 commit(s) not in %s", m.riskBase)) {
 			t.Fatalf("confirm view must state the shadowed branch's cost:\n%s", out)
@@ -1584,7 +1587,7 @@ func TestTagShadowingBranchName(t *testing.T) {
 		if m.riskBase != "origin/main" {
 			t.Fatalf("precondition: base should be origin/main, got %q", m.riskBase)
 		}
-		if n := riskCommitCount("feature/unmerged", m.riskBaseRef); n != 1 {
+		if n := riskCommitCount("feature/unmerged", m.riskBaseRef).commits; n != 1 {
 			t.Fatalf("want 1 commit at risk, got %d (the tag was used as the base)", n)
 		}
 	})
@@ -1605,8 +1608,8 @@ func TestFetchPreservesSelections(t *testing.T) {
 	tb.selected = true
 	tb.deleteRemote = true
 
-	nm, _ := m.Update(fetchPruneCmd()())
-	after := nm.(model)
+	nm, cmd := m.Update(fetchPruneCmd()())
+	after := settle(m, nm.(model), cmd)
 
 	if b := find(after.branches, "feature/unmerged"); b == nil || !b.selected {
 		t.Fatalf("a manual selection must survive a fetch: %+v", b)
@@ -1637,8 +1640,8 @@ func TestFetchDisarmsRemoteForGoneBranch(t *testing.T) {
 	// Someone else deletes the remote branch before this fetch lands.
 	git(t, repo, "push", "-q", "origin", "--delete", "feature/tracked")
 
-	nm, _ := m.Update(fetchPruneCmd()())
-	after := nm.(model)
+	nm, cmd := m.Update(fetchPruneCmd()())
+	after := settle(m, nm.(model), cmd)
 
 	b := find(after.branches, "feature/tracked")
 	if b == nil || !b.gone {
@@ -1666,8 +1669,8 @@ func TestGoneCurrentBranchIsNotPruned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nm, _ := m.Update(fetchPruneCmd()())
-	m = nm.(model)
+	nm, cmd := m.Update(fetchPruneCmd()())
+	m = settle(m, nm.(model), cmd)
 
 	b := find(m.branches, "feature/tracked")
 	if b == nil || !b.gone || !b.isCurrent {
@@ -1746,8 +1749,8 @@ func TestLocalOnlyRepo(t *testing.T) {
 	}
 
 	// `p` is a harmless no-op rather than an error.
-	nm, _ := m.Update(fetchPruneCmd()())
-	m = nm.(model)
+	nm, cmd := m.Update(fetchPruneCmd()())
+	m = settle(m, nm.(model), cmd)
 	if m.err != "" {
 		t.Fatalf("fetch must succeed with no remotes: %q", m.err)
 	}
@@ -2438,10 +2441,35 @@ func special(k tea.KeyType) tea.KeyMsg { return tea.KeyMsg{Type: k} }
 func press(t *testing.T, m model, keys ...tea.KeyMsg) model {
 	t.Helper()
 	for _, k := range keys {
-		nm, _ := m.Update(k)
+		nm, cmd := m.Update(k)
+		m = settle(m, nm.(model), cmd)
+	}
+	return m
+}
+
+// settle feeds back the message of a cmd the model started for itself, as the
+// tea runtime would: the merge queries a reload starts, and the risk count d
+// starts. was is the model before the Update that returned cmd, so work it
+// already had running stays the test's to drive.
+func settle(was, m model, cmd tea.Cmd) model {
+	if cmd != nil && (m.merging && !was.merging || m.measuring && !was.measuring) {
+		nm, _ := m.Update(cmd())
 		m = nm.(model)
 	}
 	return m
+}
+
+// openRemoteView presses tab and lands the remote rows' load and the merge
+// queries that follow it.
+func openRemoteView(t *testing.T, m model) model {
+	t.Helper()
+	nm, cmd := m.Update(special(tea.KeyTab))
+	m = nm.(model)
+	if cmd == nil {
+		t.Fatal("tab must load the remote rows")
+	}
+	nm, next := m.Update(cmd())
+	return settle(m, nm.(model), next)
 }
 
 // cursorTo puts the cursor on the named branch's view row, failing if the
@@ -2463,8 +2491,8 @@ func doSwitch(t *testing.T, m model) model {
 	if cmd == nil {
 		return m // guarded no-op: nothing was started
 	}
-	nm, _ = m.Update(cmd())
-	return nm.(model)
+	nm, next := m.Update(cmd())
+	return settle(m, nm.(model), next)
 }
 
 // currentBranch reports the checked-out branch of dir.
@@ -3003,9 +3031,10 @@ func gitStops(t *testing.T, dir string, args ...string) {
 // A rebase or bisect holds the branch it started from, and a rebase
 // --update-refs holds every branch in its stack. git refuses to delete them in
 // any worktree, under -d and -D alike, yet the worktree's HEAD is detached, so
-// neither %(HEAD) nor %(worktreepath) reports them.
+// neither %(HEAD) nor %(worktreepath) reports them. The repo's folder name holds
+// glob characters, which must not hide its linked worktrees.
 func TestHeldBranchesAreLocked(t *testing.T) {
-	repo := initRepo(t, "main")
+	repo := initRepoIn(t, filepath.Join(t.TempDir(), "a[1]"), "main")
 	commitFile(t, repo, "f", "a")
 	for _, name := range []string{"stack/base", "stack/top", "bisected", "applied"} {
 		git(t, repo, "branch", name)
@@ -3057,28 +3086,70 @@ func TestHeldBranchesAreLocked(t *testing.T) {
 			t.Fatalf("the row must show the ~ marker and the reason: %q", row)
 		}
 	}
+	// Read .selected itself: selectedBranches already drops locked rows, so it
+	// cannot show a held branch that a marked.
 	m = press(t, m, key("a"))
-	for _, b := range m.selectedBranches() {
-		if want[b.name] != "" {
-			t.Fatalf("a must skip held branch %s", b.name)
+	for name := range want {
+		if find(m.branches, name).selected {
+			t.Fatalf("a must skip held branch %s", name)
 		}
 	}
+
+	// git prints the common dir relative to the current folder, or absolute from
+	// a linked worktree, and the reads resolve it from that same folder.
+	sub := filepath.Join(repo, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{sub, bisectWT} {
+		chdir(t, dir)
+		if held := loadHeldBranches(); len(held) != len(want) {
+			t.Fatalf("from %s: held %v, want the %d branches", dir, held, len(want))
+		}
+	}
+}
+
+// A bisect cleaned up by hand can leave BISECT_START behind. git reads it only
+// while BISECT_LOG exists, so the branch it names is free to delete.
+func TestLeftoverBisectStartDoesNotLock(t *testing.T) {
+	repo := initRepo(t, "main")
+	commitFile(t, repo, "f", "a")
+	git(t, repo, "branch", "stale")
+	if err := os.WriteFile(filepath.Join(repo, ".git", "BISECT_START"), []byte("stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	chdir(t, repo)
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := find(m.branches, "stale"); b == nil || b.heldBy != "" || b.locked() {
+		t.Fatalf("stale must not be held: %+v", b)
+	}
+	git(t, repo, "branch", "-D", "stale") // ground truth: git agrees
 }
 
 // r deletes the remote branch a branch tracks, which need not share its name.
 // A branch made from origin/main tracks main, one made from a protected branch
 // tracks that branch, and one made with --track main tracks no remote branch at
-// all. None of these may be armed.
+// all. A branch made from a pull request tracks refs/pull/1/head, which is not a
+// branch: a delete pushed by its tracking name would remove a teammate's pr/1.
+// None of these may be armed.
 func TestRemoteDeleteRefusesWrongTargets(t *testing.T) {
 	repo := initRepo(t, "main")
 	commitFile(t, repo, "a", "a")
 	addOrigin(t, repo, "main")
-	git(t, repo, "push", "-q", "origin", "main:release/1.0")
+	git(t, repo, "push", "-q", "origin", "main:release/1.0", "main:pr/1", "main:refs/pull/1/head")
 	git(t, repo, "fetch", "-q")
 	git(t, repo, "config", "pruner.protect", "release/*")
 	git(t, repo, "branch", "hotfix", "origin/release/1.0")
 	git(t, repo, "branch", "feat", "origin/main")
 	git(t, repo, "branch", "--track", "stacked", "main")
+	// With the pull request refspec first, git maps origin/pr/1 back to the pull
+	// request, not to the branch pr/1.
+	git(t, repo, "config", "--replace-all", "remote.origin.fetch", "+refs/pull/*/head:refs/remotes/origin/pr/*")
+	git(t, repo, "config", "--add", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+	git(t, repo, "branch", "pr/1", "origin/pr/1")
 	git(t, repo, "switch", "-q", "-c", "feature/ok")
 	git(t, repo, "push", "-q", "-u", "origin", "feature/ok")
 	git(t, repo, "switch", "-q", "main")
@@ -3092,6 +3163,7 @@ func TestRemoteDeleteRefusesWrongTargets(t *testing.T) {
 		"hotfix":  "remote branch origin/release/1.0 is protected",
 		"feat":    "remote branch origin/main is protected",
 		"stacked": "stacked tracks local branch main",
+		"pr/1":    "pr/1 tracks refs/pull/1/head on origin",
 	} {
 		cursorTo(t, &m, name)
 		m.status = ""
@@ -3107,7 +3179,11 @@ func TestRemoteDeleteRefusesWrongTargets(t *testing.T) {
 	if m = press(t, m, key("r")); !find(m.branches, "feature/ok").deleteRemote {
 		t.Fatal("r must still arm a branch whose remote branch is its own")
 	}
-	if !remoteHasBranch(t, repo, "refs/heads/release/1.0") || !remoteHasBranch(t, repo, "refs/heads/main") {
+	if m.status != "" {
+		t.Fatalf("the last row's refusal must not stay on screen once r arms another: %q", m.status)
+	}
+	if !remoteHasBranch(t, repo, "refs/heads/release/1.0") || !remoteHasBranch(t, repo, "refs/heads/main") ||
+		!remoteHasBranch(t, repo, "refs/heads/pr/1") {
 		t.Fatal("no remote branch should have been touched")
 	}
 }
@@ -3116,33 +3192,44 @@ func TestRemoteDeleteRefusesWrongTargets(t *testing.T) {
 // fetch refspecs: with refs/heads/jb/*:refs/remotes/origin/*, origin/old is
 // jb/old, and a teammate's branch named old must survive its delete. Refs
 // fetched from outside refs/heads/ are not branches, so they are not listed.
-// Every remote's trunk is protected, not only the default remote's.
+// A protect glob matches the name a row shows, which here is not the name on the
+// remote. Each remote's trunk, as its <remote>/HEAD names it, is protected, not
+// only the default remote's.
 func TestRemoteRowsFollowFetchRefspecs(t *testing.T) {
 	repo := initRepo(t, "main")
 	commitFile(t, repo, "a", "a")
 	addOrigin(t, repo, "main")
-	git(t, repo, "push", "-q", "origin", "main:jb/old", "main:old", "main:refs/pull/1/head")
+	git(t, repo, "push", "-q", "origin", "main:jb/old", "main:old", "main:refs/pull/1/head",
+		"main:jb/main", "main:jb/release/1.0", "main:jb/release/2.0")
 	git(t, repo, "config", "--replace-all", "remote.origin.fetch", "+refs/heads/jb/*:refs/remotes/origin/*")
 	git(t, repo, "config", "--add", "remote.origin.fetch", "+refs/pull/*/head:refs/remotes/origin/pr/*")
+	git(t, repo, "config", "pruner.protect", "release/*")
 	git(t, repo, "fetch", "-q", "--prune", "origin")
+	git(t, repo, "branch", "hotfix", "origin/release/2.0")
 	fork := t.TempDir()
-	git(t, fork, "init", "--bare", "-q", "-b", "main")
+	git(t, fork, "init", "--bare", "-q", "-b", "master")
 	git(t, repo, "remote", "add", "fork", fork)
-	git(t, repo, "push", "-q", "fork", "main", "main:topic")
+	git(t, repo, "push", "-q", "fork", "main:master", "main:topic")
 	git(t, repo, "fetch", "-q", "fork")
+	git(t, repo, "remote", "set-head", "fork", "master")
 	chdir(t, repo)
 	m, err := initialModel()
 	if err != nil {
 		t.Fatal(err)
 	}
-	nm, cmd := m.Update(special(tea.KeyTab))
-	nm, _ = nm.(model).Update(cmd())
-	m = nm.(model)
+	cursorTo(t, &m, "hotfix")
+	if m = press(t, m, key("r")); find(m.branches, "hotfix").deleteRemote {
+		t.Fatal("r must refuse: origin/release/2.0 matches release/* by the name it shows")
+	}
+	m = openRemoteView(t, m)
 
 	if find(m.branches, "origin/pr/1") != nil {
 		t.Fatal("a pull request ref is not a remote branch and must not be listed")
 	}
-	if b := find(m.branches, "fork/main"); b == nil || !b.protected {
+	if b := find(m.branches, "origin/release/1.0"); b == nil || !b.protected {
+		t.Fatalf("release/* must protect the row by the name it shows: %+v", b)
+	}
+	if b := find(m.branches, "fork/master"); b == nil || !b.protected {
 		t.Fatalf("another remote's trunk must be protected: %+v", b)
 	}
 	if b := find(m.branches, "fork/topic"); b == nil || b.locked() || b.remoteBranch() != "topic" {
@@ -3156,7 +3243,10 @@ func TestRemoteRowsFollowFetchRefspecs(t *testing.T) {
 	cursorTo(t, &m, "origin/old")
 	m = press(t, m, key(" "), key("d"))
 	wantState(t, m, stateConfirm, "d opens the confirm screen")
-	nm, cmd = m.Update(key("R"))
+	if v := stripANSI(m.confirmView()); !strings.Contains(v, "origin/jb/old") {
+		t.Fatalf("the confirm screen must name the branch the push deletes:\n%s", v)
+	}
+	nm, cmd := m.Update(key("R"))
 	m = drainDeletions(t, nm.(model), cmd)
 	if r := result(t, m, "origin/old"); !r.remoteOK {
 		t.Fatalf("the delete should succeed: %+v", r)
@@ -3196,11 +3286,22 @@ func TestPartialCloneRiskIsNotGuessed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !networkBound([]string{"cherry"}) || !networkBound([]string{"diff"}) {
-		t.Fatal("cherry and diff can reach the remote in a partial clone")
+	// cherry and diff can reach the remote here, so they get the timeout and no
+	// terminal, but they keep the local cap. switch can reach it too, but a
+	// timeout would kill a checkout partway.
+	for _, cmd := range []string{"cherry", "diff"} {
+		if use := networkUse([]string{cmd}); use != (gitNet{timeout: true, noTTY: true}) {
+			t.Fatalf("%s in a partial clone: %+v", cmd, use)
+		}
+	}
+	if use := networkUse([]string{"switch"}); use != (gitNet{noTTY: true}) {
+		t.Fatalf("switch in a partial clone: %+v", use)
+	}
+	if use := networkUse([]string{"push"}); use != (gitNet{connects: true, timeout: true, noTTY: true}) {
+		t.Fatalf("push: %+v", use)
 	}
 	b := find(m.branches, "feat")
-	if !b.gone || !b.riskMeasured || b.riskCommits != riskUnknown {
+	if !b.gone || !b.riskMeasured || !b.riskFailed || b.riskCommits != 0 {
 		t.Fatalf("want a gone branch with an unknown risk count: %+v", b)
 	}
 	if status := m.selectGone(); find(m.branches, "feat").selected || !strings.Contains(status, "1 could not be checked") {
@@ -3210,9 +3311,58 @@ func TestPartialCloneRiskIsNotGuessed(t *testing.T) {
 	if w := m.riskWarning(*b); !strings.Contains(w, "an unknown number of commits") {
 		t.Fatalf("the confirm screen must say the count is unknown: %q", w)
 	}
+	// The count is 0 when git cherry fails, which must not read as clean.
+	if v := stripANSI(m.confirmView()); strings.Contains(v, "no commits missing") {
+		t.Fatalf("a failed count must not show as clean:\n%s", v)
+	}
 
 	lazyFetch.Store(false)
-	if networkBound([]string{"cherry"}) {
-		t.Fatal("outside a partial clone, cherry is local")
+	for _, cmd := range []string{"cherry", "diff", "switch"} {
+		if use := networkUse([]string{cmd}); use != (gitNet{}) {
+			t.Fatalf("outside a partial clone, %s is local: %+v", cmd, use)
+		}
+	}
+}
+
+// git cherry can reach the network in a partial clone, where each count may
+// wait out netTimeout. So no risk count runs inside Update: a reload installs
+// the new list before its merge queries, gone-branch counts and all, finish,
+// and d opens the confirm screen when its counts land.
+func TestRiskCountsRunOffTheUpdateLoop(t *testing.T) {
+	chdir(t, setupRepo(t))
+	m, err := initialModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	branches, reads, err := loadRepo(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := gitProcs.total.Load()
+	nm, cmd := m.Update(repoLoadedMsg{branches: branches, reads: reads})
+	m = nm.(model)
+	if n := gitProcs.total.Load() - before; n != 0 || cmd == nil || !m.merging {
+		t.Fatalf("a reload must run its merge queries off the update loop: %d git processes ran inside Update", n)
+	}
+	nm, _ = m.Update(cmd())
+	if m = nm.(model); m.merging {
+		t.Fatal("the merge queries must land")
+	}
+
+	cursorTo(t, &m, "feature/unmerged")
+	m = press(t, m, key(" "))
+	before = gitProcs.total.Load()
+	nm, cmd = m.Update(key("d"))
+	m = nm.(model)
+	if n := gitProcs.total.Load() - before; n != 0 || cmd == nil || !m.measuring {
+		t.Fatalf("d must count off the update loop: %d git processes ran inside Update", n)
+	}
+	wantState(t, m, stateList, "the confirm screen waits for the counts")
+	nm, _ = m.Update(cmd())
+	m = nm.(model)
+	wantState(t, m, stateConfirm, "the confirm screen opens when the counts land")
+	if b := find(m.branches, "feature/unmerged"); !b.riskMeasured || b.riskCommits != 1 || m.measuring {
+		t.Fatalf("the count must land: %+v", b)
 	}
 }
