@@ -33,7 +33,8 @@ Then run it from inside any git repository:
 git_pruner
 ```
 
-To print the build's commit and date (from Go's automatic VCS stamping):
+To print the build's version (git tag), commit, and date (from Go's automatic VCS
+stamping):
 
 ```sh
 git_pruner version     # also --version, -v

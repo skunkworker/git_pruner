@@ -2201,7 +2201,7 @@ func TestUnicodeNameAndEmptySubject(t *testing.T) {
 // The version string is well-formed even when VCS build info is absent.
 func TestVersionString(t *testing.T) {
 	s := versionString()
-	for _, want := range []string{"git_pruner", "commit:", "date:", "go:"} {
+	for _, want := range []string{"git_pruner", "version:", "commit:", "date:", "go:"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("version output missing %q:\n%s", want, s)
 		}
@@ -2211,7 +2211,7 @@ func TestVersionString(t *testing.T) {
 func TestHelpViewIncludesBuildMetadata(t *testing.T) {
 	m := model{width: 80, height: 24}
 	v := m.helpView()
-	for _, want := range []string{"git_pruner — help", "build date:", "commit:"} {
+	for _, want := range []string{"git_pruner — help", "version:", "build date:", "commit:"} {
 		if !strings.Contains(v, want) {
 			t.Fatalf("help view missing %q:\n%s", want, v)
 		}
@@ -2219,16 +2219,20 @@ func TestHelpViewIncludesBuildMetadata(t *testing.T) {
 }
 
 func TestBuildInfoLdflagsOverride(t *testing.T) {
-	origCommit, origDate, origTime := gitCommit, buildDate, buildTime
+	origVer, origCommit, origDate, origTime := version, gitCommit, buildDate, buildTime
 	defer func() {
-		gitCommit, buildDate, buildTime = origCommit, origDate, origTime
+		version, gitCommit, buildDate, buildTime = origVer, origCommit, origDate, origTime
 	}()
 
+	version = "v9.9.9"
 	gitCommit = "abcdef123456"
 	buildDate = "2026-09-01"
 	buildTime = ""
 
-	commit, date := buildInfo()
+	ver, commit, date := buildInfo()
+	if ver != "v9.9.9" {
+		t.Fatalf("expected version v9.9.9, got %q", ver)
+	}
 	if commit != "abcdef1" {
 		t.Fatalf("expected truncated commit abcdef1, got %q", commit)
 	}
