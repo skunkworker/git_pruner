@@ -356,6 +356,22 @@ func TestDiffLoadsInBackground(t *testing.T) {
 	if o := stripANSI(m.diffView()); !strings.Contains(o, "loading diff") {
 		t.Fatalf("the view must say it is loading:\n%s", o)
 	}
+	// The batch is the read and the spinner tick, in that order; the tick is
+	// not run, as waiting on its timer only slows the test.
+	read := cmd().(tea.BatchMsg)[0]().(diffReadMsg)
+	stale := read
+	stale.seq--
+	if nm, c := m.Update(stale); c != nil || nm.(model).diffRaw != "" {
+		t.Fatal("a stale read must be dropped, and must not start a layout")
+	}
+	nm, cmd = m.Update(read)
+	m = nm.(model)
+	if cmd == nil || m.diffBase != "origin/main" || !m.diffLoading {
+		t.Fatalf("the read must land and start the layout: base %q", m.diffBase)
+	}
+	if o := stripANSI(m.diffView()); !strings.Contains(o, "styling 8 lines…") || strings.Contains(o, "delta is") {
+		t.Fatalf("the view must give the size, and not name a delta that is not there:\n%s", o)
+	}
 	msg := cmd().(diffLoadedMsg)
 	old := msg
 	old.seq--
@@ -366,8 +382,8 @@ func TestDiffLoadsInBackground(t *testing.T) {
 	}
 	nm, _ = m.Update(msg)
 	m = nm.(model)
-	if m.diffLoading || !strings.Contains(strings.Join(m.diffLines, "\n"), "+b") || m.diffBase != "origin/main" {
-		t.Fatalf("diff not applied: base %q lines %q", m.diffBase, m.diffLines)
+	if m.diffLoading || !strings.Contains(strings.Join(m.diffLines, "\n"), "+b") {
+		t.Fatalf("diff not applied: lines %q", m.diffLines)
 	}
 }
 

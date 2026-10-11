@@ -835,16 +835,19 @@ func loadDiffRef(ref, name string) (diff, base string, err error) {
 // its output is used as-is, so side-by-side, line numbers and theme all come
 // from the user's own delta config; the width is passed so delta lays the
 // columns out for this terminal. Without delta (or if it fails) the raw lines
-// are returned for colorizeDiffLine.
-func styleDiff(diff string, width int) (lines []string, styled bool) {
+// are returned for colorizeDiffLine. Cancelling ctx kills delta.
+func styleDiff(ctx context.Context, diff string, width int) (lines []string, styled bool) {
 	if strings.TrimSpace(diff) == "" {
 		return nil, false
 	}
 	if path, err := exec.LookPath("delta"); err == nil {
-		cmd := exec.Command(path, "--paging=never", "--width="+strconv.Itoa(width))
+		cmd := exec.CommandContext(ctx, path, "--paging=never", "--width="+strconv.Itoa(width))
 		cmd.Stdin = strings.NewReader(diff)
 		if out, err := cmd.Output(); err == nil {
 			return strings.Split(strings.TrimRight(string(out), "\n"), "\n"), true
+		}
+		if ctx.Err() != nil {
+			return nil, false // nobody wants the answer; skip the fallback's work too
 		}
 	}
 	// The file contents are someone else's text; clean each line like a subject.

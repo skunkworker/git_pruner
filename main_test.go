@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -2769,11 +2770,11 @@ func TestStyleDiffUsesDeltaWhenPresent(t *testing.T) {
 	bin := t.TempDir()
 	t.Setenv("PATH", bin)
 
-	lines, styled := styleDiff(diff, 80)
+	lines, styled := styleDiff(context.Background(), diff, 80)
 	if styled || len(lines) != 6 {
 		t.Fatalf("without delta the raw lines must come back: styled=%v lines=%q", styled, lines)
 	}
-	if lines, styled := styleDiff("  \n", 80); styled || lines != nil {
+	if lines, styled := styleDiff(context.Background(), "  \n", 80); styled || lines != nil {
 		t.Fatalf("an empty diff has no lines: styled=%v lines=%q", styled, lines)
 	}
 
@@ -2781,7 +2782,7 @@ func TestStyleDiffUsesDeltaWhenPresent(t *testing.T) {
 	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho \"delta $*\"\n/bin/cat >/dev/null\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	lines, styled = styleDiff(diff, 120)
+	lines, styled = styleDiff(context.Background(), diff, 120)
 	if !styled || len(lines) != 1 || lines[0] != "delta --paging=never --width=120" {
 		t.Fatalf("delta must run with the terminal width and its output shown as-is: styled=%v lines=%q", styled, lines)
 	}
@@ -2789,7 +2790,7 @@ func TestStyleDiffUsesDeltaWhenPresent(t *testing.T) {
 	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if lines, styled := styleDiff(diff, 80); styled || len(lines) != 6 {
+	if lines, styled := styleDiff(context.Background(), diff, 80); styled || len(lines) != 6 {
 		t.Fatalf("a failing delta must fall back to the raw lines: styled=%v lines=%q", styled, lines)
 	}
 }
@@ -2803,7 +2804,7 @@ func TestDiffRerendersOnResize(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := model{width: 80, height: 24, state: stateDiff, diffRaw: "-a\n+b\n"}
-	m.diffLines, m.diffStyled = styleDiff(m.diffRaw, m.width)
+	m.diffLines, m.diffStyled = styleDiff(context.Background(), m.diffRaw, m.width)
 	nm, cmd := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
 	m = nm.(model)
 	if cmd == nil {
@@ -2825,6 +2826,63 @@ func TestDiffRerendersOnResize(t *testing.T) {
 	}
 	if o := stripANSI(m.diffView()); !strings.Contains(o, "· delta") || !strings.Contains(o, "w --width=140") {
 		t.Fatalf("the view must show delta's lines and name it:\n%s", o)
+	}
+}
+
+// Leaving the diff kills a delta still at work: its answer would be dropped,
+// and on a big diff it would hold a CPU core for seconds.
+func TestLeavingDiffStopsDelta(t *testing.T) {
+	bin := t.TempDir()
+	t.Setenv("PATH", bin)
+	// exec, so the kill reaches the process holding delta's output pipe.
+	if err := os.WriteFile(filepath.Join(bin, "delta"), []byte("#!/bin/sh\nexec /bin/sleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := model{width: 80, height: 24, state: stateDiff, diffRaw: "-a\n+b\n", diffLoading: true}
+	cmd := m.styleCmd()
+	done := make(chan tea.Msg, 1)
+	go func() { done <- cmd() }()
+	nm, _ := m.Update(key("q"))
+	if nm.(model).state != stateList {
+		t.Fatal("q must leave the diff")
+	}
+	select {
+	case msg := <-done:
+		if lm := msg.(diffLoadedMsg); lm.lines != nil {
+			t.Fatalf("a stopped run must skip the raw-line fallback, got %q", lm.lines)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("delta still runs after the user left the diff")
+	}
+}
+
+// The loading line turns while the diff loads, and only one tick chain runs:
+// a tick for an older request, or after the load lands, does not re-arm.
+func TestDiffSpinnerTicksWhileLoading(t *testing.T) {
+	m := model{width: 80, height: 24, state: stateDiff, diffSeq: 2, diffLoading: true,
+		diffNote: "delta is styling 121,800 lines…", diffStart: time.Now().Add(-1500 * time.Millisecond)}
+	nm, cmd := m.Update(diffTickMsg{seq: 2})
+	m = nm.(model)
+	if m.spinnerFrame != 1 || cmd == nil {
+		t.Fatalf("the tick must advance and re-arm: frame %d", m.spinnerFrame)
+	}
+	if o := stripANSI(m.diffView()); !strings.Contains(o, spinnerFrames[1]+" delta is styling 121,800 lines… 1.5s") {
+		t.Fatalf("the loading line must show the spinner, the step, and the time:\n%s", o)
+	}
+	if _, cmd := m.Update(diffTickMsg{seq: 1}); cmd != nil {
+		t.Fatal("a tick for an older request must not re-arm")
+	}
+	m.diffLoading = false
+	if _, cmd := m.Update(diffTickMsg{seq: 2}); cmd != nil {
+		t.Fatal("the tick must not re-arm once the diff has landed")
+	}
+}
+
+func TestGroupDigits(t *testing.T) {
+	for n, want := range map[int]string{0: "0", 999: "999", 1000: "1,000", 121800: "121,800", 1234567: "1,234,567"} {
+		if got := groupDigits(n); got != want {
+			t.Errorf("groupDigits(%d) = %q, want %q", n, got, want)
+		}
 	}
 }
 

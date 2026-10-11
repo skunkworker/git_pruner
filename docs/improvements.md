@@ -248,6 +248,12 @@ It left two findings on purpose: dropping the test-only `riskCommitCount`/`loadD
 (churn in a dozen tests for no behavior change), and keying the merge sets by full ref (it only
 matters for a local branch literally named like a remote one, e.g. `origin/x`).
 
+**`v` progress and delta cancel (2026-10-11).** A 121,800-line diff spent 0.05s in `git diff` and
+1.9s in delta behind a still "loading diff…" line, which read as a frozen screen. The read and the
+layout are now two cmds (`diffReadMsg`, then `styleCmd`), so the loading line turns a spinner and
+gives the step, the line count and the time. Leaving the diff, or starting another layout, kills
+the running delta through `diffCancel`; before, its answer was dropped but it ran to the end.
+
 **12. `main.go` split** into `git.go`, `model.go`, `view.go`, `cli.go`, `settings.go`,
 `proc_*.go` by an AST script — no hand edits in the move. **13.** `BINDIR` was already
 overridable; the Makefile now rebuilds on any `*.go` change.

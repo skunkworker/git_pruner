@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"os/exec"
 	"path"
 	"slices"
 	"sort"
@@ -124,16 +126,19 @@ type model struct {
 	// confirmAfterRisk). The confirm screen opens when the counts land.
 	measuring bool
 
-	spinnerFrame int // animation frame for the deleting spinner (deletion counts derive from results)
+	spinnerFrame int // animation frame for the deleting and diff-loading spinners (deletion counts derive from results)
 
-	diffBranch  string   // branch whose diff is shown in stateDiff
-	diffBase    string   // base ref the diff was computed against
-	diffRaw     string   // unified diff as git produced it; delta is re-run from it on resize
-	diffLines   []string // display lines of the diff being viewed
-	diffStyled  bool     // lines came from delta and carry their own colors
-	diffTop     int      // scroll offset within diffLines
-	diffLoading bool     // the diff (or its re-layout) is being made in the background
-	diffSeq     int      // bumped per diff request, so a slow answer for an old one is dropped
+	diffBranch  string             // branch whose diff is shown in stateDiff
+	diffBase    string             // base ref the diff was computed against
+	diffRaw     string             // unified diff as git produced it; delta is re-run from it on resize
+	diffLines   []string           // display lines of the diff being viewed
+	diffStyled  bool               // lines came from delta and carry their own colors
+	diffTop     int                // scroll offset within diffLines
+	diffLoading bool               // the diff (or its re-layout) is being made in the background
+	diffSeq     int                // bumped per diff request, so a slow answer for an old one is dropped
+	diffNote    string             // what the loading line says the load is doing
+	diffStart   time.Time          // when v was pressed; the loading line shows the time since
+	diffCancel  context.CancelFunc // stops the running layout (see stopStyle)
 
 	bodyTop int // scroll offset within the confirm/force/result body (see page)
 
@@ -228,39 +233,67 @@ type riskMsg struct {
 	counts []riskCount
 }
 
-// diffLoadedMsg carries a diff made in the background; seq ties it to one request.
-type diffLoadedMsg struct {
-	seq    int
-	base   string // "" on a re-layout: the base is unchanged
-	raw    string
-	lines  []string
-	styled bool
-	err    error
+// diffReadMsg carries the diff git produced; seq ties it to one request. The
+// read and the layout are two steps so the loading line can give the size
+// while delta works on it.
+type diffReadMsg struct {
+	seq   int
+	base  string
+	raw   string
+	delta bool // delta is on the PATH, so the layout step is the slow one
+	err   error
 }
 
-// diffCmd reads b's diff and lays it out, off the update loop: a big diff
-// through delta takes long enough to freeze the screen.
-func diffCmd(seq int, b branch, width int) tea.Cmd {
+// diffCmd reads b's diff off the update loop.
+func diffCmd(seq int, b branch) tea.Cmd {
+	return func() tea.Msg {
+		msg := diffReadMsg{seq: seq}
+		msg.raw, msg.base, msg.err = loadDiffRef(b.ref(), b.name)
+		_, err := exec.LookPath("delta")
+		msg.delta = err == nil
+		return msg
+	}
+}
+
+// diffLoadedMsg carries a diff laid out in the background; seq ties it to one request.
+type diffLoadedMsg struct {
+	seq    int
+	lines  []string
+	styled bool
+}
+
+// styleCmd lays m.diffRaw out off the update loop: a big diff through delta
+// takes seconds. An earlier run still at work is stopped first.
+func (m *model) styleCmd() tea.Cmd {
+	m.stopStyle()
+	ctx, cancel := context.WithCancel(context.Background())
+	m.diffCancel = cancel
+	seq, raw, width := m.diffSeq, m.diffRaw, m.width
 	return func() tea.Msg {
 		msg := diffLoadedMsg{seq: seq}
-		msg.raw, msg.base, msg.err = loadDiffRef(b.ref(), b.name)
-		if msg.err == nil {
-			msg.lines, msg.styled = styleDiff(msg.raw, width)
-		}
+		msg.lines, msg.styled = styleDiff(ctx, raw, width)
 		return msg
+	}
+}
+
+// stopStyle kills a running delta. Its answer would be dropped anyway, and on
+// a big diff it holds a CPU core for seconds after the user has left.
+func (m *model) stopStyle() {
+	if m.diffCancel != nil {
+		m.diffCancel()
+		m.diffCancel = nil
 	}
 }
 
 // restyleTickMsg fires a moment after a resize (see the WindowSizeMsg case).
 type restyleTickMsg struct{ seq int }
 
-// restyleCmd re-runs delta on a diff already read, for a new terminal width.
-func restyleCmd(seq int, raw string, width int) tea.Cmd {
-	return func() tea.Msg {
-		msg := diffLoadedMsg{seq: seq, raw: raw}
-		msg.lines, msg.styled = styleDiff(raw, width)
-		return msg
-	}
+// diffTickMsg advances the loading-line spinner. seq ties it to one request,
+// so a quick v, q, v cannot leave two tick chains running.
+type diffTickMsg struct{ seq int }
+
+func diffTickCmd(seq int) tea.Cmd {
+	return tea.Tick(spinnerInterval, func(time.Time) tea.Msg { return diffTickMsg{seq} })
 }
 
 // branchDeletedMsg reports the outcome of one branch's async deletion; idx is
@@ -273,8 +306,11 @@ type branchDeletedMsg struct {
 // spinnerTickMsg advances the deleting-view spinner animation.
 type spinnerTickMsg struct{}
 
-// spinnerFrames are the braille frames cycled while deletions are in flight.
+// spinnerFrames are the braille frames cycled while deletions are in flight
+// or a diff loads, one per spinnerInterval.
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+const spinnerInterval = 120 * time.Millisecond
 
 // deleteBranchCmd wraps the deleteBranch worker as a tea.Cmd so deletions run off
 // the update loop. It captures only a branch value (never the model), so each runs
@@ -287,7 +323,7 @@ func deleteBranchCmd(idx int, b branch, force, wantRemote bool) tea.Cmd {
 
 // spinnerTickCmd schedules the next spinner frame.
 func spinnerTickCmd() tea.Cmd {
-	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return spinnerTickMsg{} })
+	return tea.Tick(spinnerInterval, func(time.Time) tea.Msg { return spinnerTickMsg{} })
 }
 
 // loadFirst runs the startup reads. The repo check runs beside them rather than
@@ -500,7 +536,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil // a later resize took over, or the user left
 		}
 		m.diffLoading = true
-		return m, restyleCmd(m.diffSeq, m.diffRaw, m.width)
+		return m, m.styleCmd()
 	case mergeInfoMsg:
 		if msg.gen == m.loadGen {
 			m.applyMergeInfo(msg.info)
@@ -509,22 +545,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case riskMsg:
 		return m.landRisk(msg)
+	case diffReadMsg:
+		if msg.seq != m.diffSeq || m.state != stateDiff {
+			return m, nil // the user asked for another diff, or left
+		}
+		if msg.err != nil {
+			m.diffLoading = false
+			m.err = msg.err.Error()
+			m.state = stateList
+			return m, nil
+		}
+		m.diffBase, m.diffRaw = msg.base, msg.raw
+		if strings.TrimSpace(msg.raw) == "" {
+			m.diffLoading = false
+			return m, nil
+		}
+		m.diffNote = "styling " + groupDigits(strings.Count(msg.raw, "\n")) + " lines…"
+		if msg.delta {
+			m.diffNote = "delta is " + m.diffNote
+		}
+		return m, m.styleCmd()
 	case diffLoadedMsg:
 		if msg.seq != m.diffSeq || m.state != stateDiff {
 			return m, nil // the user asked for another diff, or left
 		}
 		m.diffLoading = false
-		if msg.err != nil {
-			m.err = msg.err.Error()
-			m.state = stateList
-			return m, nil
-		}
-		if msg.base != "" {
-			m.diffBase = msg.base
-		}
-		m.diffRaw = msg.raw
+		m.stopStyle() // the run is over; this only frees its context
 		m.diffLines, m.diffStyled = msg.lines, msg.styled
 		m.clampDiff()
+		return m, nil
+	case diffTickMsg:
+		if msg.seq == m.diffSeq && m.state == stateDiff && m.diffLoading {
+			m.spinnerFrame++
+			return m, diffTickCmd(msg.seq)
+		}
 		return m, nil
 	case undoDoneMsg:
 		return m, m.applyUndo(msg)
@@ -804,8 +858,9 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.diffBranch, m.diffBase = b.name, ""
 			m.diffRaw, m.diffLines, m.diffStyled = "", nil, false
 			m.diffTop, m.diffLoading = 0, true
+			m.diffNote, m.diffStart = "loading diff…", time.Now()
 			m.state = stateDiff
-			return m, diffCmd(m.diffSeq, *b, m.width)
+			return m, tea.Batch(diffCmd(m.diffSeq, *b), diffTickCmd(m.diffSeq))
 		}
 	case "c":
 		if b := m.cur(); b != nil && !b.isCurrent && !m.switching && !m.fetching {
@@ -948,6 +1003,7 @@ func (m *model) clampDiff() {
 func (m model) updateDiff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "esc", "v":
+		m.stopStyle()
 		m.state = stateList
 	case "ctrl+c":
 		return m, tea.Quit
