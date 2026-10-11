@@ -558,8 +558,9 @@ func (m model) helpView() string {
 		"Protect more branches with: git config --add pruner.protect 'release/*'"))
 	b.WriteString("\n\n")
 
-	commit, date := buildInfo()
-	b.WriteString(dimStyle.Render(fmt.Sprintf("build date: %s · commit: %s", date, commit)))
+	ver, commit, date := buildInfo()
+	// Own line: a pseudo-version past the tag runs over 40 characters.
+	b.WriteString(dimStyle.Render(fmt.Sprintf("version: %s\nbuild date: %s · commit: %s", ver, date, commit)))
 	b.WriteString("\n\n")
 
 	b.WriteString(dimStyle.Render("press any key to return"))
