@@ -108,8 +108,8 @@ func restoreSummary(results []deleteResult) string {
 		if r.restorable() {
 			lines = append(lines, fmt.Sprintf("  git branch %s %s", r.br.name, r.br.sha))
 		}
-		if r.remoteOK && r.br.sha != "" {
-			lines = append(lines, fmt.Sprintf("  git push %s %s:refs/heads/%s", r.br.remoteName(), r.br.sha, r.br.remoteBranch()))
+		if r.remoteOK && r.br.upSha != "" {
+			lines = append(lines, fmt.Sprintf("  git push %s %s:refs/heads/%s", r.br.remoteName(), r.br.upSha, r.br.remoteBranch()))
 		}
 	}
 	if len(lines) == 0 {

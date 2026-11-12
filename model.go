@@ -147,6 +147,7 @@ type model struct {
 	status        string // transient info message (e.g. fetch results)
 	fetching      bool   // a background fetch --all --prune is in flight
 	switching     bool   // a background git switch is in flight
+	undoing       bool   // a background undo is in flight (see confirmAfterRisk)
 }
 
 // fetchDoneMsg reports completion of an async `git fetch --all --prune`.
@@ -319,6 +320,11 @@ func deleteBranchCmd(idx int, b branch, force, wantRemote bool) tea.Cmd {
 	return func() tea.Msg {
 		return branchDeletedMsg{idx: idx, res: deleteBranch(b, force, wantRemote)}
 	}
+}
+
+// forceDeleteCmd is deleteBranchCmd for the force retry of one refused result.
+func forceDeleteCmd(idx int, r deleteResult) tea.Cmd {
+	return func() tea.Msg { return branchDeletedMsg{idx: idx, res: forceDelete(r)} }
 }
 
 // spinnerTickCmd schedules the next spinner frame.
@@ -807,7 +813,10 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "/":
 		m.state = stateFilter
 	case "m":
-		m.state, m.ageInput = stateAge, strconv.Itoa(m.config.staleDays)
+		// Before the merge queries land, no branch reads as merged.
+		if !m.waitForMerge() {
+			m.state, m.ageInput = stateAge, strconv.Itoa(m.config.staleDays)
+		}
 	case "esc":
 		// n already disarms everything; esc only lifts the filter.
 		m.filter = ""
@@ -945,10 +954,7 @@ func (m *model) startDeletions(includeRemote bool) tea.Cmd {
 	}
 	m.history = append(m.history, m.results...)
 	m.results = make([]deleteResult, len(sel))
-	m.spinnerFrame, m.abortArmed = 0, false
-	m.state, m.bodyTop = stateDeleting, 0
-
-	cmds := []tea.Cmd{spinnerTickCmd()}
+	cmds := []tea.Cmd{m.showDeleting()}
 	for i, b := range sel {
 		m.results[i] = deleteResult{br: b}
 		wantRemote := includeRemote && b.remoteArmed()
@@ -983,9 +989,7 @@ func (m model) forceableFailures() []deleteResult {
 func (m model) updateForcePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y", "Y":
-		cmd := m.forceDeleteUnmerged()
-		m.state, m.bodyTop = stateResult, 0
-		return m, cmd
+		return m, m.forceDeleteUnmerged()
 	case "n", "N", "esc", "q", "enter":
 		m.state, m.bodyTop = stateResult, 0
 	case "ctrl+c":
@@ -1063,6 +1067,12 @@ func (m *model) applyBranches(branches []branch, reads repoReads) tea.Cmd {
 // applyKeepMarks is applyBranches for a reload that deleted nothing, so the
 // user's pending marks carry over by ref.
 func (m *model) applyKeepMarks(branches []branch, reads repoReads) tea.Cmd {
+	if m.state == stateConfirm {
+		// The screen described the old list. The new one has no commit counts yet,
+		// and a fetch selects more branches, so y would answer a changed question.
+		m.state = stateList
+		m.status = "the branch list changed — check the selection and press d again"
+	}
 	return m.applyBranches(carryMarks(m.branches, branches), reads)
 }
 
@@ -1333,6 +1343,13 @@ func (m *model) measureSelectedRisk() {
 // update loop. Their riskMsg comes back here: the selection may have grown
 // while they ran.
 func (m *model) confirmAfterRisk() tea.Cmd {
+	if m.undoing {
+		// The undo's answer names rows of m.results by index. Both ways into the
+		// confirm screen pass here, so no new run can replace that list first.
+		m.measuring = false
+		m.status = "still restoring — try again in a moment"
+		return nil
+	}
 	refs := m.riskTodo()
 	if len(refs) == 0 {
 		m.measuring = false
@@ -1363,32 +1380,31 @@ func (m model) landRisk(msg riskMsg) (tea.Model, tea.Cmd) {
 }
 
 // forceDeleteUnmerged re-runs the deletions that a safe (-d) delete refused,
-// this time with -D. It updates the matching result in place so the results
-// screen reflects the retry outcome.
+// this time with -D. It runs them like the first pass, as cmds on the deleting
+// screen: each retry can push, and a push can wait out netTimeout. The results
+// land in place through branchDeletedMsg, which then opens the results screen.
 func (m *model) forceDeleteUnmerged() tea.Cmd {
-	for i := range m.results {
-		r := &m.results[i]
+	var cmds []tea.Cmd
+	for i, r := range m.results {
 		if r.localOK || !r.forceable {
 			continue
 		}
-		// deleteBranch kept the worktree while -d was going to refuse the
-		// branch; the user has now agreed to the delete, so free it.
-		if r.worktreePending() && !removeWorktree(r) {
-			continue
-		}
-		if _, err := runGit("branch", "-D", r.br.name); err != nil {
-			r.localErr = err.Error()
-			continue
-		}
-		r.localOK = true
-		r.localErr = ""
-		// The armed remote delete was deferred while the local branch survived;
-		// now that it is gone, honour what the user confirmed.
-		if r.remoteSkipped {
-			pushRemoteDelete(r)
-		}
+		m.results[i].done = false
+		cmds = append(cmds, forceDeleteCmd(i, r))
 	}
-	return m.reloadBranches()
+	if len(cmds) == 0 {
+		m.state, m.bodyTop = stateResult, 0
+		return nil
+	}
+	return tea.Batch(append(cmds, m.showDeleting())...)
+}
+
+// showDeleting opens the deleting screen for a run about to start and returns
+// the cmd that animates its spinner.
+func (m *model) showDeleting() tea.Cmd {
+	m.spinnerFrame, m.abortArmed = 0, false
+	m.state, m.bodyTop = stateDeleting, 0
+	return spinnerTickCmd()
 }
 
 // undoDoneMsg carries a background undo and the reload after it.
@@ -1407,6 +1423,9 @@ type undoDoneMsg struct {
 // .git/config.lock. A remote branch cannot come back this way: that would be a
 // push, so the exit summary prints the command instead.
 func (m *model) undo() tea.Cmd {
+	if m.undoing {
+		return nil // a second run would recreate branches the first already made
+	}
 	var todo []int
 	for i, r := range m.results {
 		if r.restorable() {
@@ -1418,6 +1437,7 @@ func (m *model) undo() tea.Cmd {
 		m.status = "nothing to undo"
 		return nil
 	}
+	m.undoing = true
 	m.status = "restoring…"
 	results, withRemote := slices.Clone(m.results), m.remoteLoaded
 	return func() tea.Msg {
@@ -1436,6 +1456,7 @@ func (m *model) undo() tea.Cmd {
 
 // applyUndo records a finished undo and installs the reload that came with it.
 func (m *model) applyUndo(msg undoDoneMsg) tea.Cmd {
+	m.undoing = false
 	remote := 0
 	for _, i := range msg.restored {
 		m.results[i].restored = true

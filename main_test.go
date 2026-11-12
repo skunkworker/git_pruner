@@ -384,8 +384,8 @@ func TestForceDeleteUnmergedRetry(t *testing.T) {
 	}
 
 	// Answering yes at the prompt retries with -D and clears the branch.
-	nm, _ := m.Update(key("y"))
-	m = nm.(model)
+	nm, cmd := m.Update(key("y"))
+	m = drainDeletions(t, nm.(model), cmd)
 	wantState(t, m, stateResult, "answering the prompt must land on the results screen")
 	if len(m.forceableFailures()) != 0 {
 		t.Fatalf("no failures should remain after force retry: %+v", m.results)
@@ -530,7 +530,8 @@ func TestDeleteBranchCmd(t *testing.T) {
 	}
 
 	// Force delete + remote push of the tracked branch.
-	tracked := branch{name: "feature/tracked", upstream: "origin/feature/tracked", ahead: 1}
+	tracked := branch{name: "feature/tracked", upstream: "origin/feature/tracked", ahead: 1,
+		upSha: git(t, repo, "rev-parse", "refs/remotes/origin/feature/tracked")}
 	dm2 := deleteBranchCmd(0, tracked, true, true)().(branchDeletedMsg)
 	if !dm2.res.localOK {
 		t.Fatalf("force local delete failed: %s", dm2.res.localErr)
@@ -1376,8 +1377,8 @@ func TestRemoteDeleteDeferredUntilLocalSucceeds(t *testing.T) {
 
 	// The force retry clears the branch, so the arming is finally honoured.
 	wantState(t, m, stateForcePrompt, "a refused -d must raise the force prompt")
-	nm, _ := m.Update(key("y"))
-	m = nm.(model)
+	nm, cmd := m.Update(key("y"))
+	m = drainDeletions(t, nm.(model), cmd)
 	r = m.results[0]
 	if !r.localOK || !r.remoteTried || !r.remoteOK || r.remoteSkipped {
 		t.Fatalf("force retry should complete both deletes: %+v", r)
@@ -3033,7 +3034,8 @@ func TestUnmergedWorktreeKeptUntilForce(t *testing.T) {
 		t.Fatalf("the force prompt must name the worktree it removes:\n%s", strings.Join(body, "\n"))
 	}
 
-	m = press(t, m, key("y"))
+	nm, cmd := m.Update(key("y"))
+	m = drainDeletions(t, nm.(model), cmd)
 	if r := result(t, m, "feature/unmerged"); !r.localOK || !r.worktreeRemoved {
 		t.Fatalf("the force retry should remove the worktree and the branch: %+v", r)
 	}

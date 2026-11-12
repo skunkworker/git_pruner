@@ -76,7 +76,7 @@ checklist), so the UI stays responsive while remote pushes complete. `ctrl+c` th
 second press: quitting mid-run can leave a remote branch behind a deleted local one.
 
 On the results screen, `u` recreates the deleted local branches at their old commits, with
-their upstream config. `enter` returns to the list, and `q` quits. When you quit, git_pruner
+their upstream config. `d` waits until a running undo has finished. `enter` returns to the list, and `q` quits. When you quit, git_pruner
 prints a restore command for every branch it deleted this session, so the way back stays in your
 scrollback:
 
@@ -85,6 +85,12 @@ git_pruner: to restore a deleted branch, run:
   git branch feature/foo 3e2210a…
   git push origin 3e2210a…:refs/heads/feature/foo
 ```
+
+The `git push` line names the commit the remote branch was at, which is not the local tip when
+the local branch was behind it.
+
+If a fetch, a checkout or an undo finishes while the confirmation screen is open, the screen
+closes and the status line says the list changed. Press `d` to review the new list.
 
 In the diff view: `↑`/`↓` scroll, `space`/`ctrl+d` page down, `ctrl+u`/`pgup` page up,
 `g`/`G` jump to top/bottom, and `q`/`esc`/`v` return to the list.
@@ -178,7 +184,10 @@ claiming the work is unrecoverable.
   with `git switch -c feat origin/main` tracks `main`. So `r` refuses when the upstream is the
   default branch or protected, when the upstream is a local branch (`--track main`), and when
   it is not a branch at all (a pull request head such as `refs/pull/1/head`). None of these
-  has a remote branch to delete. Because this affects shared history, remote deletion
+  has a remote branch to delete. The push carries a lease (`--force-with-lease`) on the commit
+  your last fetch saw, so the remote refuses the delete when a teammate pushed to the branch
+  after that fetch; fetch with `p` and review it again. A remote branch that someone else
+  already deleted counts as deleted. Because this affects shared history, remote deletion
   requires the explicit `R` key on the confirmation screen — plain `y` deletes locals only.
   The confirmation screen also shows, per branch, whether the upstream is merged into the remote
   default (`✓ merged` / `⚠ not merged`) to help you judge whether the remote is safe to delete.
@@ -266,7 +275,7 @@ default branch. It prints restore commands for what it deleted, and exits 1 if a
 
 ## Network calls
 
-`git fetch` and `git push --delete` run with `GIT_TERMINAL_PROMPT=0` and without a terminal, and
+`git fetch`, `git push --delete` and `git ls-remote` (the check after a refused lease) run with `GIT_TERMINAL_PROMPT=0` and without a terminal, and
 stop after 60 seconds. A remote that asks for a password or does not answer fails with a message,
 instead of freezing the screen. Use a credential helper or an ssh agent for remotes that need a
 login.
