@@ -363,10 +363,23 @@ confirm screen shows a failed count as clean, and fails the test.
 ### Found while fixing
 
 **34. A forced retry runs deletes and pushes inside `Update`** — `model.go`
-`forceDeleteUnmerged` — **TODO**. `y` on the force prompt runs `git branch -D` and
+`forceDeleteUnmerged` — **DONE** (2026-11-11). `y` on the force prompt ran `git branch -D` and
 `pushRemoteDelete` for each refused branch inside `Update`. A push can wait out the 60 s
-timeout, so a slow remote freezes the screen, as in 32. Fix: run the retry as a `tea.Cmd`, like
-`startDeletions`, and apply the results from a message.
+timeout, so a slow remote froze the screen, as in 32. Fixed: the retry runs as one
+`forceDeleteCmd` per branch on the deleting screen, and `branchDeletedMsg` lands each result.
+*(`TestForceRetryRunsOffTheUpdateLoop`)*
+
+### 2026-11-11 analysis
+
+Six fixes from `~/dev/docs/git_pruner/2026-11-11-analysis-findings.md`, each with a test in
+`review_test.go` that fails against the old code:
+
+- A remote delete carries `--force-with-lease` on the tracking ref's commit (`branch.upSha`).
+  *(`TestRemoteDeleteRefusesMovedBranch`)*
+- The remote result and restore command use `upSha`. *(`TestRemoteRestoreNamesRemoteCommit`)*
+- A reload closes the confirm screen. *(`TestReloadClosesConfirmScreen`)*
+- `d` and `u` wait while an undo runs. *(`TestUndoHoldsNewDeleteRun`)*
+- `m` waits for the merge status. *(`TestMergedOldWaitsForMergeStatus`)*
 
 ## Ref handling — the rule this work established
 
@@ -391,7 +404,7 @@ open in `localDefaultBranch`. It has been deleted.
 
 ## Status
 
-Tiers 1 to 5 are done. One new item, 34, is open.
+Tiers 1 to 5 and item 34 are done.
 
 The suite has **99 tests** (81 in `main_test.go`, 18 in `features_test.go`), passing under
 `-race`, with `gofmt` and `go vet` clean (2026-10-10). Tiers 1 to 3 ended at 43; Tier 4 added 4;

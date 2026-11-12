@@ -771,7 +771,7 @@ func appendResultLines(dst []string, r deleteResult) []string {
 		// Say why the armed remote survived, or it reads as a silent failure.
 		dst = append(dst, errStyle.Render("  ! ")+"kept remote "+remote+": local delete failed")
 	case r.remoteTried && r.remoteOK:
-		dst = append(dst, okStyle.Render("  ✓ ")+"deleted remote "+remote+dimStyle.Render(" (was "+r.br.hash+")"))
+		dst = append(dst, okStyle.Render("  ✓ ")+"deleted remote "+remote+dimStyle.Render(" (was "+r.br.remoteHash()+")"))
 	case r.remoteTried:
 		dst = append(dst, errStyle.Render("  ✗ ")+"remote "+remote+": "+r.remoteErr)
 	}

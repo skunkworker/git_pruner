@@ -30,6 +30,10 @@ type branch struct {
 	upstream     string // e.g. "origin/feature"; "" when no upstream is configured
 	upRemote     string // branch.<name>.remote, kept so undo can restore tracking
 	upMerge      string // branch.<name>.merge, e.g. "refs/heads/feature"
+	// upSha is the commit the tracking ref was at when the list was read: what a
+	// remote delete expects to remove, and what its restore command pushes back.
+	// The local tip is not it when the branch is behind or has diverged.
+	upSha        string
 	ahead        int
 	behind       int
 	gone         bool // upstream was configured but no longer exists
@@ -116,6 +120,14 @@ func (b branch) remoteName() string {
 // The remote's name can hold a slash, so it is trimmed whole.
 func (b branch) shownBranch() string { return strings.TrimPrefix(b.upstream, b.remoteName()+"/") }
 
+// remoteHash is upSha shortened for display.
+func (b branch) remoteHash() string {
+	if b.upSha == b.sha {
+		return b.hash
+	}
+	return b.upSha[:min(7, len(b.upSha))]
+}
+
 func (b branch) remoteBranch() string {
 	if s, ok := strings.CutPrefix(b.upMerge, "refs/heads/"); ok {
 		return s
@@ -184,7 +196,7 @@ func networkUse(args []string) gitNet {
 	}
 	lazy := lazyFetch.Load()
 	switch args[0] {
-	case "push", "fetch":
+	case "push", "fetch", "ls-remote":
 		return gitNet{connects: true, timeout: true, noTTY: true}
 	case "cherry", "diff":
 		// Both read file contents, which a partial clone fetches on demand.
@@ -408,6 +420,7 @@ type remoteRefs struct {
 	names  []string          // remote names, "origin" first
 	exists map[string]bool   // fully qualified ref -> present
 	symref map[string]string // fully qualified symbolic ref -> the ref it names
+	sha    map[string]string // fully qualified ref -> its commit
 	rows   []branch          // every non-symbolic remote branch; only when asked for
 }
 
@@ -417,10 +430,12 @@ type remoteRefs struct {
 // withRows also reads each ref's commit for the remote view. That costs a commit
 // read per ref, so it is only paid once the user has opened that view.
 func loadRemoteRefs(withRows bool) remoteRefs {
-	rr := remoteRefs{exists: map[string]bool{}, symref: map[string]string{}}
-	format := "%(symref)%00%(refname)"
+	rr := remoteRefs{exists: map[string]bool{}, symref: map[string]string{}, sha: map[string]string{}}
+	// The full commit ID is free: it sits in the ref itself. The short one is
+	// not, since git must search the object store for a unique prefix.
+	format, shaAt := "%(symref)%00%(refname)%00%(objectname)", 2
 	if withRows {
-		format = "%(symref)%00" + commitFormat
+		format, shaAt = "%(symref)%00"+commitFormat, 3
 	}
 	out, err := runGit("for-each-ref", "--format="+format, "refs/remotes")
 	if err != nil {
@@ -434,6 +449,9 @@ func loadRemoteRefs(withRows bool) remoteRefs {
 		}
 		ref, target := f[1], f[0]
 		rr.exists[ref] = true
+		if len(f) > shaAt {
+			rr.sha[ref] = f[shaAt]
+		}
 		if target != "" {
 			rr.symref[ref] = target
 		} else if withRows && len(f) >= 7 {
@@ -442,6 +460,7 @@ func loadRemoteRefs(withRows bool) remoteRefs {
 			// The row is its own upstream, which lets the merge query and the
 			// push --delete path treat it like a local branch's remote copy.
 			b.upstream = b.name
+			b.upSha = b.sha
 			rr.rows = append(rr.rows, b)
 		}
 		// The first segment after the namespace is the remote's name.
@@ -728,6 +747,10 @@ func loadRepo(withRemote bool) ([]branch, repoReads, error) {
 		b := &branches[i]
 		b.mainWorktree = mainWT != "" && b.worktree == mainWT
 		b.heldBy = held[b.ref()]
+		// An upstream that is a local branch finds nothing here; r refuses it.
+		if b.upstream != "" {
+			b.upSha = reads.remotes.sha["refs/remotes/"+b.upstream]
+		}
 	}
 	return branches, reads, err
 }
@@ -933,13 +956,65 @@ func removeWorktree(res *deleteResult) bool {
 func pushRemoteDelete(res *deleteResult) {
 	res.remoteSkipped = false
 	res.remoteTried = true
+	if res.br.upSha == "" {
+		// A gone upstream has no tracking ref. A delete with no expected commit
+		// would remove whatever someone pushed there since.
+		res.remoteErr = "no tracking ref says what the remote branch holds — fetch (p), then try again"
+		return
+	}
 	// Qualify the remote branch: a remote carrying both a branch and a tag of that
 	// name rejects a bare refspec as matching more than one ref, deleting nothing.
-	if _, err := runGit("push", res.br.remoteName(), "--delete", branchRef(res.br.remoteBranch())); err != nil {
-		res.remoteErr = err.Error()
-	} else {
+	ref := branchRef(res.br.remoteBranch())
+	// The lease makes the remote refuse when its branch is not at the commit the
+	// user reviewed. The ✓ and the commit count describe the last fetch; a plain
+	// --delete would also remove what a teammate pushed after it.
+	lease := "--force-with-lease=" + ref + ":" + res.br.upSha
+	_, err := runGit("push", lease, res.br.remoteName(), "--delete", ref)
+	switch {
+	case err == nil:
 		res.remoteOK = true
+	case !strings.Contains(err.Error(), "stale info"):
+		res.remoteErr = err.Error()
+	case remoteBranchAbsent(res.br.remoteName(), ref):
+		// Someone else deleted the branch first, which is the outcome the user
+		// asked for. A push --delete drops the tracking ref; do the same here, or
+		// the branch comes back as a remote-only row until the next fetch.
+		res.remoteOK = true
+		runGit("update-ref", "-d", "refs/remotes/"+res.br.upstream, res.br.upSha)
+	default:
+		res.remoteErr = "the remote branch moved since the last fetch — fetch (p), then review it again"
 	}
+}
+
+// remoteBranchAbsent asks the remote whether ref is gone from it. A lease
+// refusal alone cannot tell a deleted branch from a moved one.
+func remoteBranchAbsent(remote, ref string) bool {
+	out, err := runGit("ls-remote", remote, ref)
+	return err == nil && strings.TrimSpace(out) == ""
+}
+
+// forceDelete retries with -D a delete that -d refused, and runs the remote
+// delete that was waiting on it. It is the worker forceDeleteCmd runs off the
+// update loop. The result is never forceable again: a second prompt could only
+// offer the same -D.
+func forceDelete(r deleteResult) deleteResult {
+	r.done, r.forceable = true, false
+	// deleteBranch kept the worktree while -d was going to refuse the branch;
+	// the user has now agreed to the delete, so free it.
+	if r.worktreePending() && !removeWorktree(&r) {
+		return r
+	}
+	if _, err := runGit("branch", "-D", r.br.name); err != nil {
+		r.localErr = err.Error()
+		return r
+	}
+	r.localOK, r.localErr = true, ""
+	// The armed remote delete was deferred while the local branch survived;
+	// now that it is gone, honour what the user confirmed.
+	if r.remoteSkipped {
+		pushRemoteDelete(&r)
+	}
+	return r
 }
 
 // restoreBranch recreates a deleted local branch at its old commit and puts its

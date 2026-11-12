@@ -20,3 +20,11 @@
 - [x] Partial clones: `git switch` could show an ssh prompt over the screen
 - [x] Partial clones: commit counts ran 3 at a time (the push cap), not 8
 - [x] Commit counts ran inside the screen's update loop, so a slow partial clone froze the screen
+
+### November 11
+- [x] A remote delete removed commits a teammate pushed after the last fetch
+- [x] A fetch, checkout or undo that landed on the confirm screen removed its warnings and added branches
+- [x] The remote result and the `git push` restore command named the local tip, not the remote's commit
+- [x] `y` on the force prompt ran deletes and pushes inside the screen's update loop
+- [x] An undo followed by a fast new delete crashed with an index out of range
+- [x] `m` during the load selected nothing instead of waiting for the merge status
